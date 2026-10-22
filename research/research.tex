@@ -1,0 +1,960 @@
+\documentclass[10pt,a4paper,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2cm]{geometry}
+\setlength{\columnsep}{0.8cm}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{xcolor}
+\definecolor{proc}{RGB}{0,128,0}
+\definecolor{conc}{RGB}{200,0,0}
+\newcommand{\pro}[1]{\Statex\textcolor{proc}{\textbf{+}\ #1}}
+\newcommand{\con}[1]{\Statex\textcolor{conc}{\textbf{$-$}\ #1}}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\algrenewcommand\algorithmiccomment[1]{\hfill\# #1}
+\usepackage{hyperref}
+
+\title{Research Notes: Origin Identification of LLM-Generated Text}
+\author{Working notes (mostly written by Claude Code)}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Regulatory background}
+
+\subsection{EU AI Act, Article 50 (transparency obligations)}
+Source: text of Art.~50 as pasted by the author (the paste carried an ``AMENDED'' marker on para.~7).
+\textbf{TODO:} verify against the Official Journal version and any later amendments.
+
+\paragraph{Art.~50(2) --- core obligation for this thesis.}
+Providers of AI systems (including general-purpose ones) generating synthetic audio, image, video \emph{or text} must ensure outputs are
+\begin{itemize}
+  \item \textbf{marked in a machine-readable format}, and
+  \item \textbf{detectable} as artificially generated or manipulated.
+\end{itemize}
+Technical solutions must be \emph{effective, interoperable, robust and reliable} ``as far as technically feasible'', taking into account content-type specificities, implementation costs and the generally acknowledged state of the art (possibly reflected in technical standards).
+
+\emph{Exemptions:} the AI system performs an assistive function for standard editing; does not substantially alter the deployer's input or its semantics; or use is authorised by law for criminal-offence detection/prosecution.
+
+\paragraph{Art.~50(4), second subparagraph --- deployer duty for text.}
+Deployers of AI that generates/manipulates text published to inform the public on matters of public interest must disclose its artificial origin. Not applicable if the content underwent human review or editorial control and a person holds editorial responsibility (or for law-enforcement uses).
+
+\paragraph{Art.~50(5).} Information must be clear and distinguishable, at the latest at first interaction/exposure, and meet accessibility requirements.
+
+\paragraph{Art.~50(7) --- codes of practice.}
+The Commission encourages codes of practice on detection, marking and labelling of AI-generated content, assesses their adequacy (Art.~56(6)), and may adopt an implementing act with common rules (Art.~98(2)) if a code is inadequate.
+
+\subsection{Why this matters for the thesis}
+\begin{itemize}
+  \item The law demands \emph{robustness} and \emph{reliability} ``as far as technically feasible'' --- directly motivates the adversarial evaluation: a watermark that dies under paraphrase arguably fails the ``robust'' requirement.
+  \item ``Machine-readable marking'' for plain text cannot rely on metadata (strippable by copy-paste), so the signal must live \emph{in the text}: watermarking in generation, plus fingerprinting as a fallback for unmarked/unknown-source text.
+  \item The duty falls on \emph{providers}; detection by third parties must work with limited access to the generator, which motivates black-box fingerprint features and probabilistic fusion.
+  \item The ``assistive editing / no substantial change'' exemption makes the human+AI mixed and lightly edited text cases legally and technically relevant.
+\end{itemize}
+
+\subsection{Open items}
+\begin{itemize}
+  \item Current status and content of the Code of Practice on marking/labelling AI-generated content.
+  \item Application dates for Art.~50 and any postponement.
+  \item C2PA and why metadata-based provenance does not cover plain text.
+\end{itemize}
+
+\section{Text watermarking: algorithms}
+Sources: original papers in \texttt{articles/pdfs/} (kgw, unigram, sweet, ewd, sir, upv, exp\_edit, semstamp, k\_semstamp); taxonomy from Wu et al.\ (CL 2025). Notation: $V$ vocabulary, $\ell_t$ logits, $p_t=\mathrm{softmax}(\ell_t)$, $y_t$ emitted token, $T$ number of scored tokens, $\gamma$ green fraction, $\delta$ bias, $|s|_G=\sum_t\mathbf 1[y_t\in G_t]$. The common detection statistic is
+\begin{equation}\label{eq:z}
+z=\frac{|s|_G-\gamma T}{\sqrt{T\gamma(1-\gamma)}}.
+\end{equation}
+
+\begin{algorithm}[H]\small
+\caption{KGW soft red list (Kirchenbauer et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require prompt, green fraction $\gamma\in(0,1)$, strength $\delta>0$, threshold $\tau$ ($=4$)
+\Procedure{Generate}{}
+ \For{$t=0,1,\dots$}
+  \State $\ell_t\gets M(\text{prompt},y_{<t})$
+  \State seed RNG with $\mathrm{hash}(y_{t-1})$
+  \State partition $V$ into $G_t$ ($|G_t|=\gamma|V|$) and $R_t$ ($(1-\gamma)|V|$)
+  \State $\hat\ell_{t,v}\gets\ell_{t,v}+\delta\,\mathbf 1[v\in G_t]$ \ for all $v$
+  \State $y_t\sim\mathrm{softmax}(\hat\ell_t)$
+ \EndFor
+\EndProcedure
+\Procedure{Detect}{$y_{1:T}$}
+ \State $|s|_G\gets\sum_t\mathbf 1[y_t\in G_t]$, $G_t$ recomputed from $\mathrm{hash}(y_{t-1})$
+ \State $z\gets$ Eq.~\eqref{eq:z}
+ \State \Return $z>\tau$
+\EndProcedure
+\pro{no model/API access needed at detection; low false-positive rate; degrades gracefully under attack; detected after about 800 tokens even with attacks (Kirchenbauer et al.\ 2023b)}
+\con{distorts the output distribution ($\delta$); weak on low-entropy text; with context $h$ one edited token changes $h$ lists (attack amplification, or small $h$ is insecure); paraphrasing weakens it}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{KGW self-hash: choose token $y_t$ (window $h$, key $K$, boost $\delta$)}
+\begin{algorithmic}[1]
+\State sort $V$ by logit, highest first: $v_0,v_1,\dots$ with logits $\ell_0\ge\ell_1\ge\dots$ \Comment{$v_k$ = one token, $\ell_k$ = its logit}
+\State $k\gets0$
+\While{true}
+ \State $y_t\gets v_k$ \Comment{candidate}
+ \State $H_i\gets F_K(y_t,y_{t-i})$ for $i=1..h$ \Comment{hash of candidate + one earlier token}
+ \State $\mathit{seed}\gets\min_i H_i$
+ \State $\mathit{bit}\gets\mathrm{PRG}(\mathit{seed})$ \Comment{1 = green (prob.\ $\gamma$), 0 = red}
+ \If{$\mathit{bit}=1$}
+  \State \Return $y_t$ \Comment{highest-logit green token}
+ \ElsIf{$\ell_{k+1}<\ell_0-\delta$}
+  \State \Return $v_0$ \Comment{no green token within $\delta$ of the top: take the top (red) token}
+ \Else
+  \State $k\gets k+1$ \Comment{next candidate is within $\delta$ of the top: try it}
+ \EndIf
+\EndWhile
+\pro{wide window $h$ without attack amplification (a changed token alters position $t$ w.p.\ only $1/h$); $|V|^2$ distinct lists hide the rule}
+\con{greedy per-token search over sorted logits (extra cost); still a quality-reducing logit bias; falls back to red token if no green token within $\delta$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Unigram-Watermark (Zhao et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require RNG $F$, $\gamma$, $\delta$, threshold $\tau$ ($=6$)
+\Procedure{Generate}{}
+ \State key $\mathsf k\gets F$; fix $G\subset V$, $|G|=\gamma|V|$, $R=G^c$ \Comment{once}
+ \State $\hat\ell_{t,v}\gets\ell_{t,v}+\delta\,\mathbf 1[v\in G]$ for every prefix
+\EndProcedure
+\Procedure{Detect}{$y_{1:n},\mathsf k$}
+ \State $|y|_G\gets\sum_{t=1}^n\mathbf 1[y_t\in G]$
+ \State $z_y\gets(|y|_G-\gamma n)/\sqrt{n\gamma(1-\gamma)}$
+ \State \Return $z_y>\tau$
+\EndProcedure
+\pro{provable quality, type-I/II error and security guarantees; linear time; no model or prompt at detection; robust to cropping and minor edits}
+\con{single fixed green list: readily reverse-engineered by about $|V|$ detection-API queries; same token always same colour; larger $\delta$ lowers quality}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{SWEET (Lee et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require entropy threshold $\tau_H\in[0,\log|V|]$, $\gamma$, $\delta$, $z_{\mathrm{thr}}$
+\Procedure{Generate}{}
+ \For{$t=0,1,\dots$}
+  \State $p_t\gets\mathrm{softmax}(\ell_t)$; \ $H_t\gets-\sum_vp_{t,v}\log p_{t,v}$
+  \If{$H_t>\tau_H$}
+   \State seed RNG with $\mathrm{hash}(y_{t-1})$; split $V\to G_t,R_t$
+   \State $\ell_{t,v}\gets\ell_{t,v}+\delta$ for $v\in G_t$
+  \EndIf
+  \State $y_t\sim\mathrm{softmax}(\ell_t)$
+ \EndFor
+\EndProcedure
+\Procedure{Detect}{$x,y_{0:N-1}$}
+ \State $N^h\gets0$, $N^h_G\gets0$
+ \For{$t=0,\dots,N-1$}
+  \State recompute $H_t$ \Comment{needs model and prompt}
+  \If{$H_t>\tau_H$}
+   \State $N^h\gets N^h+1$; recover $G_t$ from $\mathrm{hash}(y_{t-1})$
+   \If{$y_t\in G_t$} \State $N^h_G\gets N^h_G+1$ \EndIf
+  \EndIf
+ \EndFor
+ \State $z\gets\dfrac{N^h_G-\gamma N^h}{\sqrt{N^h\gamma(1-\gamma)}}$; \ \Return $z>z_{\mathrm{thr}}$
+\EndProcedure
+\pro{keeps code correct by skipping low-entropy tokens; $>$10\% AUROC over WLLM and EXP-EDIT; stays detectable on short code}
+\con{detection needs the model and prompt to recompute entropy; entropy threshold $\tau_H$ must be tuned on human code; designed for code}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{EWD detection (Lu et al.\ 2024; generation = KGW)}
+\begin{algorithmic}[1]
+\Require LM $M$, prompt $x$, text $T=(T_0,\dots,T_{n-1})$, key $k$, context window $m$, threshold $\tau$, green fraction $\gamma$, spike modulus $\rho$ (called $\tau$ in EWD, $z$ in KGW), offset $C_0$, increasing function $f$
+\For{$l=m,\dots,n-1$}
+ \State $p_l\gets\mathrm{softmax}\big(M(x,T_{:l-1})\big)$ \Comment{next-token distribution at step $l$, a vector over $V$}
+ \State $SE_l\gets\sum_{v\in V}\dfrac{p_{l,v}}{1+\rho\,p_{l,v}}$ \Comment{spike entropy: $\approx1$ if flat, $\approx1/(1+\rho)$ if one token takes all}
+ \State $W_l\gets f(SE_l-C_0)$ \Comment{weight of token $l$ (paper analysis: $f$ linear, $W_l=SE_l-C_0$)}
+\EndFor
+\State $S\gets0$ \Comment{weighted green count (called $|s|_G$ in the paper)}
+\For{$l=m,\dots,n-1$}
+ \State $G\gets$ green list from key $k$ and $T_{l-m:l-1}$ \Comment{as in KGW}
+ \If{$T_l\in G$} \State $S\gets S+W_l$ \EndIf
+\EndFor
+\State $z'\gets\dfrac{S-\gamma\sum_{l=m}^{n-1}W_l}{\sqrt{\gamma(1-\gamma)\sum_{l=m}^{n-1}W_l^2}}$
+\State \Return $z'>\tau$ \Comment{watermarked?}
+\pro{no manual entropy threshold; every token weighted by its entropy; better on low-entropy text; robust to back-translation; same performance on high-entropy text}
+\con{detection-only (generation stays KGW, so inherits its weaknesses); needs model logits at detection; weight function $f$ and $C_0$ are design choices}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{SIR (Liu et al.\ 2024)}
+\begin{algorithmic}[1]
+\Require strength $\delta$, embedder $E$ (BERT), trained watermark model $\mathcal T$, scalars $k_1,k_2,R,\lambda_1,\lambda_2$
+\Procedure{Generate}{}
+ \State $P_M\gets M(x^{\text{prompt}},t_{:l-1})$; \ $e_l\gets E(t_{:l-1})$
+ \State $P_W\gets\tanh(k_2\mathcal T(e_l))\in[-1,1]^{|V|}$
+ \State $P_{\hat M}\gets P_M+\delta P_W$; sample next token
+\EndProcedure
+\Procedure{Detect}{$t_{1:N}$}
+ \State $z\gets\frac1N\sum_{j=1}^NP_W^{(t_j)}(x^{\text{prompt}},t_{:j-1})$ \Comment{null: mean 0, sd 1}
+ \State \Return $z>$ threshold
+\EndProcedure
+\Procedure{Train $\mathcal T$}{}
+ \State $L_s\gets\sum_{i,j}\Big|\cos(\mathcal T(e_i),\mathcal T(e_j))-\tanh\big(k_1(\cos(e_i,e_j)-\overline{\cos(e,e')})\big)\Big|$
+ \State $L_n\gets\sum_i\big|\sum_j\mathcal T(e_i)_{(j)}\big|+\sum_i\big|\sum_j\mathcal T(e_j)_{(i)}\big|+\lambda_1\sum_{i,j}\big|R-\mathcal T(e_j)_{(i)}\big|$
+ \State minimise $L=L_s+\lambda_2L_n$
+\EndProcedure
+\pro{robust to synonym substitution and paraphrase while keeping security; X-SIR extends to translation}
+\con{needs a trained watermark model and an embedder at both generation and detection; null hypothesis only approximately true, no guarantee out of domain}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{UPV (Liu et al.\ 2024)}
+\begin{algorithmic}[1]
+\Require LM $M$, window $w$, top-$K$, boost $\delta$, green fraction $\gamma$; two small trained networks:
+\Statex \quad $E$: token embedding, \emph{not} BERT. A 5-layer MLP: 16-bit binary token ID $\to\mathbb R^{64}$
+\Statex \quad $\mathrm{FFN}$: 3-layer MLP $\mathbb R^{64w}\to64\to64\to1$, then sigmoid and rounding to $\{0,1\}$
+\Statex \quad $\mathrm{LSTM}$: 5-layer, input 64, hidden 128, linear output $\to1$, sigmoid (detector)
+\Statex \quad $a\oplus b$ = vector concatenation
+\Procedure{Generate}{$x_{0:n-1}$} \Comment{choose next token $x_n$}
+ \State $\ell\gets M(x_{0:n-1})$; \ $C\gets$ the $K$ tokens with the highest logit
+ \For{each candidate $c\in C$}
+  \State $r_c\gets\mathrm{FFN}\big(E(x_{n-w+1})\oplus\dots\oplus E(x_{n-1})\oplus E(c)\big)$ \Comment{1 = green, 0 = red}
+ \EndFor
+ \State $\ell_c\gets\ell_c+\delta\cdot r_c$ for $c\in C$; \ sample $x_n$ from $\mathrm{softmax}(\ell)$ \Comment{top-$K$ or beam search}
+\EndProcedure
+\Procedure{DetectWithGenerator}{$x_{0:n-1}$} \Comment{needs the generation net $W$=(E,FFN)}
+ \State $r_t\gets\mathrm{FFN}\big(E(x_{t-w+1})\oplus\dots\oplus E(x_t)\big)$ for $t=w-1,\dots,n-1$
+ \State $T\gets n-w+1$ \Comment{number of scored windows}; \ $|s|_G\gets\sum_tr_t$
+ \State $z\gets\dfrac{|s|_G-\gamma T}{\sqrt{\gamma(1-\gamma)T+\sigma^2T}}$ \Comment{$\sigma$: measured sd of the green ratio of $W$, since $W$ gives only $\approx\gamma$}
+\EndProcedure
+\Procedure{DetectPublic}{$x_{0:n-1}$} \Comment{public: only the detector net, no $W$ and no key}
+ \State \Return $\mathrm{LSTM}\big(E(x_0)\oplus\dots\oplus E(x_{n-1})\big)>0.5$ \Comment{$E$: copied from the generator, frozen}
+\EndProcedure
+\Statex \# training: $W$ is trained on windows with a fraction $\gamma$ of positive labels; the LSTM is trained on random token-ID sequences, labeled 1 iff the $z$-score from $W$ exceeds a threshold (sequence treated as cyclic)
+\pro{public verification without the generation key; lower FPR and better paraphrase resistance than WLLM}
+\con{detector network slightly worse than key-based z-test (e.g.\ FNR up to 4.7\% on OPT-1.3B); two networks to train; green ratio $\hat\gamma$ only approximately constant; spoofing via token frequencies only hard for large windows}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{EXP-EDIT family (Kuditipudi et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require model $M$, variant $\in\{$ITS, EXP$\}$, secret key $\xi=(\xi_1,\dots,\xi_n)$ (shared with detector, used cyclically, e.g.\ $n=256$); output length $m$, block size $k$, edit penalty $\gamma$, resamples $T_r$, key law $\nu$ (how keys are drawn)
+\Statex \quad ITS: $\xi_j=(u_j,\pi_j)$, $u_j\sim\mathrm{Unif}[0,1]$, $\pi_j$ random permutation of $V$ ($\pi_j(v)$ = position of $v$)
+\Statex \quad EXP: $\xi_j\in[0,1]^{|V|}$, one uniform number $\xi_{j,v}$ per token $v$
+\Procedure{Generate}{prompt}
+ \State $\tau\sim\mathrm{Unif}\{0,\dots,n-1\}$ \Comment{random start in the key, so different texts use different parts}
+ \For{$i=1,\dots,m$}
+  \State $\mu\gets\mathrm{softmax}\big(M(\text{prompt},y_{<i})\big)$; \ $j\gets(\tau+i)\%n$
+  \If{ITS}
+   \State $\mathit{order}[\pi_j[v]]\gets v$ for every token ID $v\in\{0..|V|-1\}$ \Comment{$\mathit{order}[r]$ = ID of the token with rank $r$}
+   \State $s\gets0$
+   \For{$r=0,1,\dots,|V|-1$}
+    \State $v\gets\mathit{order}[r]$; \ $s\gets s+\mu[v]$ \Comment{$\mu[v]$ = probability of token $v$}
+    \If{$s\ge u_j$} \State $y_i\gets v$; \textbf{break} \Comment{$y_i$ is one token ID (an integer)} \EndIf
+   \EndFor
+  \Else
+   \State $y_i\gets\arg\min_{v\in V}\ -\log(\xi_{j,v})/\mu(v)$
+  \EndIf
+ \EndFor
+ \State \Return $y$
+\EndProcedure
+\Procedure{Detect}{$y$} \Comment{$y$ of any length, possibly edited or cropped; returns a $p$-value}
+ \State $\mathrm{cost}(v,j)\gets|u_j-\tfrac{\pi_j(v)-1}{|V|-1}|$ (ITS) or $-\log\xi_{j,v}$ (EXP) \Comment{how badly token $v$ fits key position $j$}
+ \For{each key $\xi'\in\{\xi,\xi^{(1)},\dots,\xi^{(T_r)}\}$ with $\xi^{(t)}\sim\nu$ fresh random keys}
+  \State $\phi(\xi')\gets\infty$
+  \For{each block start $i\in\{1..|y|-k+1\}$ and key start $j\in\{1..n\}$}
+   \State $D[a][0]\gets\gamma a$; $D[0][b]\gets\gamma b$ for $0\le a,b\le k$
+   \State $D[a][b]\gets\min\big(D[a-1][b-1]+\mathrm{cost}(y_{i+a-1},(j+b-1)\%n),\ D[a-1][b]+\gamma,\ D[a][b-1]+\gamma\big)$
+   \State $\phi(\xi')\gets\min\big(\phi(\xi'),D[k][k]\big)$ \Comment{best-matching block (edit distance)}
+  \EndFor
+ \EndFor
+ \State \Return $\hat p=\dfrac{1+|\{t:\phi(\xi^{(t)})\le\phi(\xi)\}|}{T_r+1}$ \Comment{small $\hat p$ = text fits the true key much better than random keys}
+\EndProcedure
+\pro{distortion-free; exact non-asymptotic $p$-value; robust to editing and cropping (about 40--50\% of tokens changed)}
+\con{detection cost $O(mnk^2)$ plus permutation resampling; same text for same key unless shifted; key reuse across queries re-introduces distortion unless $n=\omega(mT^2)$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{SemStamp (Hou et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require LM $P_{\mathrm{LM}}$, prompt $s^{(0)}$, $T$ sentences; encoder $M_{\mathrm{embd}}$ (dim $h$), LSH dim $d$, $\gamma$, margin $m$, $N_{\max}$, prime $p$
+\Function{Sig}{$s$} \State $v\gets M_{\mathrm{embd}}(s)$; \Return $[\mathbf 1[n^{(i)}\!\cdot v>0]]_{i=1}^d$ \EndFunction
+\Function{Margin}{$s,m$} \State $v\gets M_{\mathrm{embd}}(s)$; \Return $\min_i|\cos(v,n^{(i)})|\ge m$ \EndFunction
+\Procedure{Generate}{}
+ \State draw $n^{(1)},\dots,n^{(d)}\in\mathbb R^h$ \Comment{$2^d$ regions}
+ \For{$t=1,\dots,T$}
+  \State seed $\gets[\textsc{Sig}(s^{(t-1)})]_{10}\cdot p$
+  \State split $\{0,1\}^d$ into valid $G^{(t)}$ ($\gamma2^d$) and blocked $R^{(t)}$
+  \Repeat
+   \State sample $s^{(t)}\sim P_{\mathrm{LM}}(\cdot\mid s^{(<t)})$
+  \Until{($\textsc{Sig}(s^{(t)})\in G^{(t)}$ \textbf{and} \textsc{Margin}$(s^{(t)},m)$) \textbf{or} $N_{\max}$ tries}
+ \EndFor
+\EndProcedure
+\Procedure{Detect}{text}
+ \State split into $s_1..s_N$; $S_V\gets\sum_{t\ge2}\mathbf 1[\textsc{Sig}(s_t)\in G^{(t)}(s_{t-1})]$
+ \State \Return $z=\dfrac{S_V-\gamma N}{\sqrt{\gamma(1-\gamma)N}}$
+\EndProcedure
+\pro{robust to paraphrase, including the bigram paraphrase attack; better quality than token-level WLLM}
+\con{rejection sampling: about 13.8 candidate sentences per valid one; fails on sentence reordering (DIPPER) and when machine text is a small part of human text; needs a fine-tuned encoder}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{$k$-SemStamp generation and detection (Hou et al.\ 2024)}
+\begin{algorithmic}[1]
+\Require LM, prompt $s^{(0)}$, domain $\mathcal D$, $T$, $N_{\max}$, margin $m$, $\gamma$, $K$ clusters, prime $p$, $N$ samples
+\Function{Initialize}{$\mathcal D,K$}
+ \State $\mathcal D'_N\sim\mathcal D$; \Return $C_K\gets k\text{-means}(\mathcal D'_N,K)$
+\EndFunction
+\Function{Assign}{$s,C_K$} \State \Return $\arg\min_{i\le K}d_{\cos}(v,c_i)$, $v=M^{\mathcal D}_{\mathrm{embd}}(s)$ \EndFunction
+\Procedure{Generate}{}
+ \State $C_K\gets\textsc{Initialize}(\mathcal D,K)$
+ \For{$t=1,\dots,T$}
+  \State $q^{(t-1)}\gets\textsc{Assign}(s^{(t-1)},C_K)$; seed $\gets q^{(t-1)}\cdot p$
+  \State split cluster indices into valid $G^{(t)}$ ($\gamma K$) and blocked $R^{(t)}$ ($(1-\gamma)K$)
+  \Repeat
+   \State sample $s^{(t)}$ from LM
+  \Until{$q^{(t)}\in G^{(t)}$ \textbf{and} $d_{\cos}(v,c_q)<\min_{i\ne q}d_{\cos}(v,c_i)-m$, \textbf{or} $N_{\max}$ tries}
+ \EndFor
+\EndProcedure
+\Procedure{Detect}{$T,C_K$}
+ \State $s_1..s_N\gets$ sentence-tokenise $T$; $q^{(1)}\gets\textsc{Assign}(s_1,C_K)$; $S_V\gets0$
+ \State $G^{(1)}\gets\textsc{RandomSample}(q^{(1)}p,K,\gamma)$
+ \For{$t=2,\dots,N$}
+  \State $q^{(t)}\gets\textsc{Assign}(s_t,C_K)$; \ \textbf{if} $q^{(t)}\in G^{(t-1)}$ \textbf{then} $S_V\gets S_V+1$
+  \State $G^{(t)}\gets\textsc{RandomSample}(q^{(t)}p,K,\gamma)$
+ \EndFor
+ \State \Return $z=\dfrac{S_V-\gamma N}{\sqrt{\gamma(1-\gamma)N}}$
+\EndProcedure
+\pro{robust to paraphrase, including the bigram paraphrase attack; better quality than token-level WLLM}
+\con{rejection sampling: about 13.8 candidate sentences per valid one; fails on sentence reordering (DIPPER) and when machine text is a small part of human text; needs a fine-tuned encoder}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Data-driven (backdoor) watermarks}
+
+\begin{algorithm}[H]\small
+\caption{Backdoor watermark for pre-trained LMs (Gu et al.\ 2022)}
+\begin{algorithmic}[1]
+\Require PLM $f(\cdot;\theta)$, proxy dataset $D^{\mathrm{pro}}$ per task $i=1..K$, trigger (rare word, e.g.\ ``cf'', or common-word combination, e.g.\ ``green idea nose''), target label $y_i^T$, trigger-embedding params $\theta_{E_w}$, epochs $T$, rate $\alpha$, task weights $\lambda_i$ ($=1$), threshold
+\Procedure{Embed}{}
+ \State $D^w_i\gets\{(W(x),y^T_i)\mid(x,y)\in D^{\mathrm{pro}}_i\}$, $W$ inserts the trigger into a random portion of samples
+ \State \Comment{combination trigger: also add $(W^\ast(x),y)$, $W^\ast$ inserts a random sub-sequence, with the true label}
+ \State $\theta^{\mathrm{clean}}_i\gets\arg\min_\theta\sum_{(x,y)\in D^{\mathrm{pro}}_i}L(f_i(x;\theta),y)$
+ \State $\mathit{ori\_norm}\gets\|\theta_{E_w}\|_2$
+ \For{$t=1..T$}
+  \For{$i=1..K$} \State sample batch $x^\ast$ from $D^w_i$; \ $L_i\gets L(f_i(x^\ast;\theta_{E_w},\theta_r),y^T_i)$; \ $g_i\gets\nabla_{\theta_{E_w}}L_i$ \EndFor
+  \State $g\gets\sum_i\lambda_ig_i$; \ $\theta_{E_w}\gets\theta_{E_w}-\alpha g$; \ $\theta_{E_w}\gets\theta_{E_w}\cdot\mathit{ori\_norm}/\|\theta_{E_w}\|_2$
+ \EndFor
+ \State release $f(\cdot;\theta^\ast)$ with $\theta^\ast=(\theta\setminus\theta_{E_w})\cup\theta^\ast_{E_w}$ \Comment{only trigger embedding changed}
+\EndProcedure
+\Procedure{Verify}{target model $f(\cdot;\theta^T)$, $D^w$}
+ \State $\mathrm{WESR}\gets\big|\{x\in D^w:f(x;\theta^T)=y^T\}\big|/|D^w|$; \ \Return $\mathrm{WESR}>$ threshold \Comment{black-box queries}
+\EndProcedure
+\pro{ownership checkable in a black-box setting; survives later fine-tuning (WESR $\approx$ 100\% on IMDB, SST-2, MNLI, SNLI, PAWS with little accuracy loss); multi-task variant; common-word trigger is harder to filter than a rare word}
+\con{marks the \emph{model}, not individual generated texts; rare-word triggers are detectable and filterable; trigger can be recovered with weight access (Lucas and Havens 2023); needs proxy datasets and retraining}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Clean-label backdoor watermark for datasets (Tang et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require dataset $D_{ori}=\{(x_i,y_i)\}$, target class $C$, pre-trained model $f$, steps $T$, trigger $t$
+\Function{TextPerturb}{$x=[v_1..v_m],y,f$}
+ \State $A\gets\emptyset$
+ \For{$1\le i\le|x|$} \State $a\gets$ highest-scoring of $\{\mathrm{replace}(x,i),\mathrm{insert}(x,i)\}$; \ $A\gets A\cup\{a\}$ \EndFor \Comment{replace: WordNet synonym; insert: extra word; keep sentence-embedding cosine close}
+ \For{$1\le t\le T$}
+  \State $a\gets$ highest-scoring in $A$; \ $A\gets A\setminus\{a\}$; \ $x^{(t)}\gets\mathrm{apply}(a,x^{(t-1)})$; \ \textbf{if} $f(x^{(t)})\ne y$ \textbf{then return} $x^{(t)}$
+ \EndFor
+ \State \Return $x^{(T)}$
+\EndFunction
+\Procedure{Mark}{}
+ \State $D_{wm}\subset D_{ori}$, a small portion of class $C$ only (label unchanged)
+ \State $\hat x\gets\textsc{TextPerturb}(x)$ for $x\in D_{wm}$ \Comment{disables natural features; images/audio: PGD $x^{(t+1)}=\Pi_{clip}(x^{(t)}+\alpha\,\mathrm{sgn}\nabla_xL)$, $\|\hat x-x\|_\infty\le\epsilon$}
+ \State stamp trigger: word-level (insert dictionary word at start/middle/end) or style-level (e.g.\ casual $\to$ formal)
+\EndProcedure
+\Procedure{Verify}{suspect $f$, $D_{test}$, trigger $t$}
+ \State $p=f_C(x_t)$, $q=f_C(x)$ \Comment{target-class softmax with / without trigger}
+ \State Wilcoxon signed-rank test of $H_0:p-q<\alpha$; reject at level $0.05$ $\Rightarrow$ dataset was used
+\EndProcedure
+\pro{label-consistent samples, so not visibly wrong; about 1\% watermarked samples suffice; works for text, image and audio; non-i.i.d.-safe Wilcoxon test}
+\con{protects a \emph{dataset} (detects training on it), not LLM output; classification setting; word triggers are visible; needs a surrogate model for the perturbation and model retraining}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Post-processing watermarks}
+
+\begin{algorithm}[H]\small
+\caption{Black-box synonym watermark (Yang et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require text $\mathbf T=(w_1..w_n)$, hash $h$ (SHA-256), BERT, thresholds $\tau_{\mathrm{sent}},\tau_{\mathrm{word}}$, weight $\lambda$, $z$-level $Z_\alpha$, $K$ candidates
+\Function{Bit}{$w_i,w_{i-1}$} \State \Return $\mathrm{RandomBinary}(h(w_i)\oplus h(w_{i-1}))$ \EndFunction
+\Function{Candidates}{$\mathbf T,w_i$}
+ \State $\tilde w_i\gets$ dropout on the embedding of $w_i$; \ $C\gets$ top-$K$ BERT predictions for $\tilde w_i$ in context
+ \State $C'\gets\emptyset$
+ \For{$s\in C$}
+  \State $\mathbf T'\gets\mathbf T$ with $w_i\to s$
+  \State $S_{\mathrm{sent}}\gets\cos(\mathrm{SentEmb}(\mathbf T),\mathrm{SentEmb}(\mathbf T'))$ \Comment{RoBERTa-MNLI}
+  \State $S_{\mathrm{global}}\gets\cos(\mathrm{w2v}(w_i),\mathrm{w2v}(s))$; \ $S_{\mathrm{context}}\gets\frac1L\sum_{l=1}^L\cos(f^l(w_i,c_{\mathbf T}),f^l(s,c_{\mathbf T'}))$
+  \State $S_{\mathrm{word}}\gets\lambda S_{\mathrm{context}}+(1-\lambda)S_{\mathrm{global}}$
+  \If{$S_{\mathrm{sent}}\ge\tau_{\mathrm{sent}}$ \textbf{and} $S_{\mathrm{word}}\ge\tau_{\mathrm{word}}$} \State $C'\gets C'\cup\{s\}$ \EndIf
+ \EndFor
+ \State \Return $C'$
+\EndFunction
+\Procedure{Inject}{$\mathbf T$}
+ \For{$i=2,\dots,n$}
+  \If{\textsc{PosFilter}$(w_i)$ \textbf{and} $\textsc{Bit}(w_i,w_{i-1})=0$}
+   \State $C'\gets\textsc{Candidates}(\mathbf T,w_i)$
+   \State $w_i\gets\arg\max_{s'_k\in C',\ b_k=1}S_{\mathrm{word}}(s'_k,w_i)$, \ $b_k=\mathrm{RandomBinary}(h(s'_k)\oplus h(w_{i-1}))$
+  \EndIf
+ \EndFor
+\EndProcedure
+\Procedure{Detect}{$\mathbf T$}
+ \State $N\gets0$, $c\gets0$
+ \For{$i=2,\dots,n$}
+  \If{\textsc{PosFilter}$(w_i)$ \textbf{and} (fast \textbf{or} $\textsc{Candidates}(\mathbf T,w_i)\ne\emptyset$)} \Comment{precise mode}
+   \State $N\gets N+1$; \ \textbf{if} $\textsc{Bit}(w_i,w_{i-1})=1$ \textbf{then} $c\gets c+1$
+  \EndIf
+ \EndFor
+ \State $\hat p\gets c/N$; \ $Z\gets\dfrac{\hat p-p_0}{\sqrt{p_0(1-p_0)/N}}$, $p_0=0.5$; \ \Return $Z>Z_\alpha$
+\EndProcedure
+\pro{works on black-box LLMs, third party can add it; robust to retranslation, polishing, word deletion, synonym substitution; meaning preserved}
+\con{relies on POS exclusion lists and several large models (BERT, RoBERTa, GloVe); precise detection costs candidate generation per word; synonym rules are a systematic pattern an attacker can target}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Context-aware lexical substitution watermark (Yang et al.\ 2022)}
+\begin{algorithmic}[1]
+\Require sentence $S=\{t_1..t_N\}$, $\mathrm{BERT}_{gen}$, $\mathrm{BERT}_{score}$ (RoBERTa-MNLI), $K=32$, spacing $f=1$, bits $m$
+\Function{LS}{$S,i$} \Comment{ranked candidates $RW$ for $t_i$}
+ \State $S_{\setminus i}\gets\{t_1..t_{i-1},[\mathrm{MASK}],t_{i+1}..t_N\}$; \ $I_i\gets S\,[\mathrm{SEP}]\,S_{\setminus i}$
+ \State $W\gets$ top-$K$ words from $\mathrm{BERT}_{gen}(I_i)$ (morphological derivatives of $t_i$ removed)
+ \For{$w\in W$}
+  \State $\hat S\gets S$ with $t_i\to w$; \ $I'_i\gets S\,[\mathrm{SEP}]\,\hat S$; \ $SR_w\gets\mathrm{BERT}_{score}(I'_i)$ \Comment{P(entailment)}
+ \EndFor
+ \State \Return $W$ sorted by $SR_w$ descending
+\EndFunction
+\Function{ST}{$i,S$} \Comment{synchronicity test, Eq.~(6)}
+ \State $FC=\{w'_1,w'_2\}\gets$ top-2 of $\textsc{LS}(S,i)$ with $SR>0.95$
+ \State $\hat S_j\gets S$ with $t_i\to w'_j$; \ $FC_j\gets$ same procedure on $\hat S_j$, $j=1,2$
+ \State $\mathit{Sync}\gets[\mathrm{Sort}(FC_1)=\mathrm{Sort}(FC_2)=\mathrm{Sort}(FC)]$; \ \Return $\mathit{Sync},\ C=\{c_1,c_2\}=\mathrm{Sort}(FC)$
+\EndFunction
+\Procedure{Embed}{$S,m$}
+ \State $\mathit{latest}\gets0$; $\mathit{index}\gets2$; $S_w\gets S$; $\mathit{Risk}\gets\{\text{punct., stopwords, subwords}\}$
+ \While{$\mathit{index}<N-f$}
+  \State $\mathit{ctx}\gets\{t_1..t_{\mathit{index}+1}\}$ in $S_w$
+  \If{$t_{\mathit{index}}\in\mathit{Risk}$} \State $\mathit{index}\gets\mathit{index}+1$; \textbf{continue} \EndIf
+  \State $\mathit{Sync},C\gets\textsc{ST}(\mathit{index},\mathit{ctx})$; \ $\mathit{Subst}\gets(t_{\mathit{index}}\in C)\wedge\mathit{Sync}$
+  \If{$\mathit{Subst}$ \textbf{and} $\mathit{index}-\mathit{latest}\ne f+1$} \Comment{substitutability test}
+   \For{$c\in C$}
+    \State $\mathit{new}\gets\{t_1..c,t_{\mathit{index}}\}$; \ $\mathit{Sync}',C'\gets\textsc{ST}(\mathit{index}-1,\mathit{new})$
+    \State \textbf{if} $t_{\mathit{index}-1}\in C'\wedge\mathit{Sync}'$ \textbf{then} $\mathit{Subst}\gets$ False
+   \EndFor
+  \EndIf
+  \If{$\mathit{Subst}$}
+   \State take next unembedded bit $\mathit{signal}$ of $m$; \ $t_{\mathit{index}}\gets c_1$ if $\mathit{signal}=0$ else $c_2$ \Comment{Eq.~(7)}
+   \State $\mathit{latest}\gets\mathit{index}$; \ $\mathit{index}\gets\mathit{index}+f+1$
+  \Else \State $\mathit{index}\gets\mathit{index}+1$
+  \EndIf
+ \EndWhile
+ \State \Return $S_w$
+\EndProcedure
+\Procedure{Extract}{$S_w$} \State same loop; at each substitutable $t_{\mathit{index}}$ output $\mathit{signal}=0$ if $t_{\mathit{index}}=c_1$ else $1$ \EndProcedure
+\pro{context-aware candidates with high semantic relatedness; recoverable bit payload; works on any text}
+\con{synchronicity and substitutability tests exclude many words, so low capacity; extraction fails if the text is changed enough to alter candidate sets; rule-based pattern}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{DeepTextMark (Munyer \& Zhong 2023)}
+\begin{algorithmic}[1]
+\Require Word2Vec, Universal Sentence Encoder (USE), NLTK POS tagger, inflection engine, BERT, $n$ nearest words
+\Procedure{Insert}{text}
+ \For{each sentence $s$}
+  \State candidates $\gets$ words that are not punctuation, stopwords or whitespace
+  \State for each candidate: $n$ nearest Word2Vec vectors $\to$ replacement words; keep those with the same grammatical number and POS tag
+  \State $\mathit{proposals}\gets$ sentences with candidate words replaced (single, multiple or any-word substitution)
+  \State $\mathit{best}\gets\arg\max_{p}\cos\big(\mathrm{USE}(s),\mathrm{USE}(p)\big)$; \ output $\mathit{best}$ \Comment{no human in the loop}
+ \EndFor
+\EndProcedure
+\Procedure{DetectSentence}{$s$}
+ \State $e\gets\mathrm{BERT}(s)$; \ $h\gets\mathrm{Transformer}(e)$; \ pool; dropout; $\mathrm{FC}_{20}$; dropout; $\mathrm{FC}_1$ $\to$ watermark score
+ \State train with binary cross-entropy; first BERT frozen, then unfrozen with a smaller Adam rate
+\EndProcedure
+\Procedure{DetectText}{sentences}
+ \State majority vote over sentence decisions; $P(\mathrm{correct})=\sum_{x>\lceil n/2\rceil}\binom nxp^x(1-p)^{n-x}\to1$ for $p>0.85$
+\EndProcedure
+\pro{blind detection (no original text); automatic, no human intervention; classifier gets near-perfect on long documents by voting}
+\con{one bit per text (zero-bit), no payload; needs a trained BERT detector; synonym substitution can be reversed by paraphrase; per-sentence accuracy must be high}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Multi-bit watermark with invariant features (Yoo et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require cover text $X$, message $m$, infill model $\theta$ (BERT), top-$k_1$, $k_2\le k_1$, NER, YAKE, spaCy parser, NLI model
+\Function{$g_1$}{$X$} \Comment{Phase 1: mask positions $S$ from invariant features}
+ \State \textbf{Keyword:} keywords $\gets$ NER entities $\cup$ YAKE terms; mask words adjacent to keywords
+ \State \textbf{Syntactic:} parse dependencies; mask dependency types in a fixed order until the target number of masks is reached
+ \State never mask keywords \Return $S$
+\EndFunction
+\Procedure{DependencyOrder}{held-out sentences} \Comment{Alg.~1 of the paper}
+ \For{each sentence $X$, each word $x_i$} \State $X'\gets\mathrm{Infill}(X_{\setminus i})$; \ $s\gets\mathrm{NLI}(X',X)$; \ $D[x.\mathrm{dep}]\mathrm{.append}(s)$ \EndFor
+ \State \Return dependency types sorted by mean entailment score, descending
+\EndProcedure
+\Function{$g_2$}{$X,S$} \Comment{Phase 2: valid watermark set}
+ \State for each mask $s_i\in S$: $T_i\gets$ top-$k_1$ infill tokens; remove punctuation, subwords, stopwords; keep top-$k_2$, sort alphabetically
+ \State $\mathbf T\gets T_{s_1}\times\dots\times T_{s_j}$; \ $\mathbf X\gets$ texts with tokens substituted
+ \State $\mathbf X_{wm}\gets\{X_i\in\mathbf X\mid g_1(X_{wm})=g_1(X_i)\}$; assign a bit string to each element
+\EndFunction
+\Procedure{Embed}{$X,m$} \State $S\gets g_1(X)$; $\mathbf X_{wm}\gets g_2(X,S)$; \Return the element whose assigned bits equal $m$ \EndProcedure
+\Procedure{Extract}{$\tilde X_{wm}$} \State $\tilde S\gets g_1(\tilde X_{wm})$; $\tilde{\mathbf X}_{wm}\gets g_2(\tilde X_{wm},\tilde S)$; \Return bits of $\tilde X_{wm}$ in that set \EndProcedure
+\Procedure{Train robust infill}{}
+ \State for corrupted $\tilde X$ (insert/delete/substitute $\mathrm{round}(CR\cdot N)$ words, $CR=2.5\text{--}5\%$, similarity $\ge0.98$): $p_i\gets$ target over top-$k_1$ tokens on $X_{\setminus i}$ (renormalised, detached); $\tilde p_i\gets$ prediction on $\tilde X_{\setminus i}$
+ \State minimise reverse KL $\sum_i D_{KL}(\tilde p_i\,\|\,p_i)$ over masked positions chosen by $g_1$
+\EndProcedure
+\pro{multi-bit payload; mask positions depend on features that survive corruption ($R_{g_1}\approx0.92$--$0.97$ vs.\ $0.61$--$0.66$ for ContextLS); error-free extraction without corruption; robust infill model improves robustness}
+\con{needs NER, parser, NLI and infill models; $g_2$ (infill output) is much less robust than $g_1$ unless the infill model is fine-tuned; synonym-level edits, small capacity per word}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Classical character and lexical schemes (survey-level description only)}
+\begin{algorithmic}[1]
+\Require payload bits; sources not on arXiv, so these steps follow Wu et al.\ Sec.~5.1.3, not the original papers
+\Procedure{EasyMark}{text, bits} \Comment{Rizzo et al.\ 2016}
+ \State replace regular spaces U+0020 with another blank code point (e.g.\ U+2004), or use variant selectors, homoglyphs or substrings of slightly different length, chosen by the bit to embed
+\EndProcedure
+\Procedure{UniSpaChi}{text, bits} \Comment{Por et al.\ 2012}
+ \State insert chosen Unicode space characters between sentences, words, lines and paragraphs to carry the bits
+\EndProcedure
+\Procedure{T-Lex}{text, payload} \Comment{Winstein 1998}
+ \State replace words with synonyms until the word-choice hash of the text encodes the payload
+\EndProcedure
+\Procedure{Topkara}{text, payload} \Comment{Topkara et al.\ 2006}
+ \State WordNet synonym substitutions, then further changes to maximise ambiguity and stay near the distortion threshold
+\EndProcedure
+\Procedure{Xiang}{text, payload} \Comment{Xiang et al.\ 2018}
+ \State quantise payload-carrying synonyms into binary sequences; compress with adaptive binary arithmetic coding; embed by substitution (reversible)
+\EndProcedure
+\pro{character methods: invisible, work on short text and any format (Easymark); lexical methods: no model needed}
+\con{systematic patterns that are easy to find and strip (normalising Unicode, re-typing, paraphrase); synonym methods ignore sentence-level meaning}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Sequence-to-sequence watermarks}
+
+\begin{algorithm}[H]\small
+\caption{AWT (Abdelnabi \& Fritz 2021)}
+\begin{algorithmic}[1]
+\Require sentence $S=\{W_0..W_n\}$, message $M=\{b_0..b_q\}$ ($q=4$ bits per $\approx$80-word segment), encoder $E$, decoder $D$ (transformers), message decoder $\mathcal M$, discriminator $A$, weights $w_\ast$
+\Function{Hide}{$S,M$}
+ \State $e\gets\mathrm{AvgPool}_t(E(S))+\mathrm{Linear}(M)$ \Comment{shared embedding}
+ \State $S'\gets\mathrm{GumbelSoftmax}(D(\text{shifted }S,\ e))$ \Comment{one-hot fwd, soft bwd}
+\EndFunction
+\Function{Reveal}{$S'$} \State \Return $\hat M=\mathrm{Linear}(\mathrm{AvgPool}_t(\mathcal M(S')))$ \EndFunction
+\Procedure{Train stage 1}{}
+ \State $L_{rec}\gets\mathrm{CE}(S',S)$; \ $L_m\gets\mathrm{BCE}(\hat M,M)$
+ \State $L_{disc}\gets-\log A(S)-\log(1-A(S'))$; \ $L_A\gets-\log A(S')$
+ \State minimise $L_1=w_AL_A+w_{rec}L_{rec}+w_mL_m$ ($A$ minimises $L_{disc}$ alternately; $w_m\approx5\times$ others)
+\EndProcedure
+\Procedure{Fine-tune stage 2}{}
+ \State $L_{sem}\gets\|F(S)-F(S')\|$ \Comment{$F$: InferSent}; \ $L_{LM}\gets-\sum_i\log p_{LM}(W'_i\mid W'_{<i})$ \Comment{AWD-LSTM}
+ \State minimise $L_2=w_AL_A+w_{rec}L_{rec}+w_mL_m+w_{sem}L_{sem}+w_{LM}L_{LM}$
+\EndProcedure
+\Procedure{Verify}{document}
+ \State split into segments; decode $\hat M$ per segment; $k\gets$ matching bits against expected sequence out of $n$
+ \State $p=\Pr(X\ge k\mid H_0)=\sum_{i\ge k}\binom ni0.5^n$; \ reject $H_0$ if $p<0.05$ (or $0.01$)
+\EndProcedure
+\pro{end-to-end learned; adversarial discriminator gives secrecy; preserves semantics}
+\con{only 4 bits per $\approx$80-word segment, so long text needed; needs training; weaker removal resistance than REMARK-LLM (per Wu et al.)}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{REMARK-LLM (Zhang et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require text $T=\{T_1..T_t\}$, binary signature $M$, Seq2Seq $(\mathbf S_e,\mathbf S_d)$, layers $\mathbf R_m,\mathbf R_n,\mathbf R_e$, extractor $\mathbf E$ (transformer), $w_1,w_2,w_w,w_t$
+\Function{Encode}{$T,M$}
+ \State $\mathcal S_e(T+M)\gets\mathbf S_e(T)\ \text{(norm. }\mathbf R_n)+\mathbf R_n(\mathbf R_m(M))$ \Comment{message added to every token}
+ \State \Return $\mathcal S(T+M)=\mathbf S_d(\mathcal S_e(T+M))$ \Comment{distribution over $V$}
+\EndFunction
+\Function{Reparam}{$\mathcal S_i$} \State \Return $\hat{\mathcal S}_i=\dfrac{\exp((\log\mathcal S_i+g_i)/\tau)}{\sum_{j=1}^{|V|}\exp((\log\mathcal S_j+g_j)/\tau)}$, $g_i\sim\mathrm{Gumbel}(0,1)$ \EndFunction
+\Function{Decode}{$\hat{\mathcal S}$} \State \Return $M'=\mathbf E(\mathcal H)$, $\mathcal H=\mathbf R_e(\hat{\mathcal S})$ \EndFunction
+\Procedure{Train}{}
+ \State mask input with $T_M\in\{0,1\}^{|T|}$ each epoch
+ \State $L_S\gets-\frac1{|T|}\sum_{i=1}^{|T|}\sum_{j=1}^{|V|}T_{ij}\log\mathcal S_{ij}(T\cdot T_M+M)$
+ \State $\hat{\mathcal S}_t\gets$ randomly drop/add/replace tokens in $\hat{\mathcal S}$; \ $M'_t\gets\mathbf E(\mathbf R_e(\hat{\mathcal S}_t))$
+ \State $L_M\gets w_w\sum_i|M_i-M'_i|+w_t\sum_i|M_i-M'_{t,i}|$; \ minimise $L=w_1L_S+w_2L_M$
+\EndProcedure
+\Procedure{Insert}{$\bar T,\bar M,\boldsymbol\tau,B,K$}
+ \State $\mathit{best}\gets0$; $\bar T_{wm}\gets$ None
+ \For{$k=1..K$}
+  \State mask $\bar T_M$; \ $\mathcal S\gets\textsc{Encode}(\bar T\cdot\bar T_M,\bar M)$; \ $\mathcal S_{\mathrm{noisy},i}\gets\mathcal S_i+\mathrm{Gumbel}(\mathcal S_i,\tau_k)$
+  \State $\{T_{ki}\}\gets\textsc{BeamSearch}(\mathcal S_{\mathrm{noisy}},B)$
+  \For{each $T_{ki}$}
+   \State $a\gets\mathrm{Accuracy}(\mathbf E(T_{ki}),\bar M)$; \ \textbf{if} $a>\mathit{best}$ \textbf{then} $\mathit{best}\gets a$, $\bar T_{wm}\gets T_{ki}$
+  \EndFor
+ \EndFor
+ \State \Return $\bar T_{wm}$
+\EndProcedure
+\Procedure{Extract}{$\bar T_{wm}$}
+ \State $\bar M'\gets\mathbf E(\mathbf R_e(\bar T_{wm}))$; \ $z\gets\dfrac{|N|-\mu}{\sigma}$, $\mu=|M|p$, $\sigma^2=|M|p(1-p)$, $p=0.5$, $|N|$ = matched bits
+\EndProcedure
+\pro{more than twice the signature bits of AWT; trained against drop/add/replace noise; works on black-box LLM output}
+\con{heavy training; insertion needs $K$ beam searches with the extractor in the loop; assumes the adversary lacks the private models}
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Not yet sourced:} Aaronson's original EXP (blog; only the Kuditipudi variant above), SynthID-Text, and the original papers behind the survey-level box (Easymark, UniSpaChi, T-Lex, Topkara, Xiang; not on arXiv). The attack paper Lucas \& Havens 2023 (backdoor trigger search) is not a watermarking scheme and is only cited in the pros/cons.
+
+\section{Statistics-based detection: count-based n-gram methods}
+Sources: Gall\'e et al.\ 2021 (arXiv 2111.02878) and Hamed \& Wu 2023 (arXiv 2308.11767), both described in Wu et al.\ Sec.~5.2. Neither needs the generator or a key; the signal is that LLM text repeats high-order n-grams more (Gall\'e) or reuses a narrower vocabulary of technical bigrams (Hamed \& Wu).
+
+\begin{algorithm}[H]\small
+\caption{Repeat-based self-training detector (Gall\'e et al.\ 2021)}
+\begin{algorithmic}[1]
+\Require document collection $D$, number of classifiers $K$, $\mathit{minLen}=20$ chars, $\mathit{minOcc}=3$
+\Function{Detection}{$D,K$}
+ \State $\mathit{repeats}\gets\textsc{Supermaximal}(D,\mathit{minLen},\mathit{minOcc})$ \Comment{raw text, suffix array + LCP, linear time}
+ \For{$k=1..K$}
+  \State $\mathit{subset}\gets$ random 20 repeats
+  \State $\mathit{pos}\gets\{d\in D:\exists r\in\mathit{subset},\ r\in d\}$ \Comment{pseudo-labelled machine}
+  \State $\mathit{neg}\gets$ random $|\mathit{pos}|$ documents from $D$ \Comment{noisy (unsupervised) or true human text (weakly supervised)}
+  \State $\mathit{clf}_k\gets\textsc{Train}(\mathit{pos},\mathit{neg})$ \Comment{binary classifier}
+ \EndFor
+ \State $\mathit{score}(d)\gets\sum_{k=1}^K\mathbf 1\big[\mathit{clf}_k(\mathrm{machine}\mid d)>\mathit{clf}_k(\mathrm{human}\mid d)\big]$ for all $d\in D$
+ \State \Return $D$ sorted by $\mathit{score}$ \Comment{ranking, not a per-document decision}
+\EndFunction
+\pro{unsupervised, no generator access, linear-time repeats}
+\con{ranks a \emph{collection}, cannot judge a single text; a single repeat is weak evidence; needs many documents from the same generator; thresholds (20 chars, 3 occurrences) fixed ad hoc}
+\end{algorithmic}
+\end{algorithm}
+A repeat $r$ is \emph{super-maximal} if it occurs $\ge\mathit{minOcc}$ times and no repeated string contains it (if $a\!\cdot\! r$ or $r\!\cdot\! a$ is also repeated for some symbol $a$, $r$ is not super-maximal). It works on a \emph{collection}, not on a single text.
+
+\begin{algorithm}[H]\small
+\caption{xFakeBibs bigram-network detector (Hamed \& Wu 2023)}
+\begin{algorithmic}[1]
+\Require training set (100 real abstracts), 10 calibration folds of 100 real abstracts each, article $a$ to classify
+\Procedure{Train}{}
+ \State build bigram network $\mathcal G_{\mathrm{train}}$ from TF-IDF bigrams (words = nodes, bigram = edge); $\mathit{LCC}\gets$ largest connected component
+\EndProcedure
+\Procedure{Calibrate}{}
+ \For{each fold $f=1..10$}
+  \For{each article $a\in f$}
+   \State $B\gets$ TF-IDF bigrams of $a$; \ $c_a\gets0$
+   \For{$b\in B$}
+    \State \textbf{if} $b$ adds an edge between existing nodes of $\mathit{LCC}$ (no new node) \textbf{then} $c_a\gets c_a+1$
+   \EndFor
+   \State reset the training network to its original state
+  \EndFor
+  \State $\bar c_f\gets$ mean of $c_a$ over the fold
+ \EndFor
+ \State $\mathit{lo}\gets\min_f\bar c_f$; \ $\mathit{hi}\gets\max_f\bar c_f$ \Comment{reported: 21.96 and 25.12}
+\EndProcedure
+\Function{Classify}{$a$}
+ \State $c_a\gets$ as above \Return POSITIVE (real) if $\mathit{lo}\le c_a\le\mathit{hi}$ else NEGATIVE (fake)
+\EndFunction
+\pro{simple, interpretable; 98/100 ChatGPT abstracts flagged}
+\con{one domain (PubMed Alzheimer's), GPT-3.5, 100 articles; bounds calibrated on same domain; 2 missed; single-article detection remains hard; says little about edited or short text}
+\end{algorithmic}
+\end{algorithm}
+Structural ratio used in the bulk analysis: $\mathrm{Ratio}=\dfrac{\#\text{newly introduced edges (no new nodes)}}{\#\text{original edges}}$.
+
+\paragraph{Caveat on the numbers.} Wu et al.\ summarise the result as ``ChatGPT accounted for only 23\% of the bigram content''. In the paper the \emph{23\%} is the share of new edges that join the training network's largest connected component without adding nodes (real folds: 51--70\%); the plain bigram overlap with the training data is 9\% for ChatGPT vs.\ 19--22\% for the real folds. The 98/100 detection is on one domain (PubMed abstracts on Alzheimer's disease), 100 articles, GPT-3.5, with the bounds calibrated on the same domain, so it says little about domain shift or short or edited text.
+
+\section{Adversarial attacks on detectors}
+Sources: Wu et al.\ (CL 2025) Sec.~8.2 gives the taxonomy (paraphrase, adversarial, prompt, training-threat attacks); the exact procedures below come from the original papers in \texttt{articles/pdfs/} (dipper\_paraphrase, sadasivan, deepwordbug, wolff\_attacking, shi\_redteam, lu\_sco, escape, henrique\_parrots, kulkarni\_grover). In every box green $+$ = what makes the attack work, red $-$ = its limits. Common setting: detector $f(y)\in[0,1]$ (higher = more likely machine), threshold $\tau$, attacker wants $f(y')<\tau$ while $y'$ keeps the meaning and quality of $y$. Quality is measured by perplexity (e.g.\ OPT-13B) or paraphrase similarity (P-SP), detection by TPR at fixed low FPR.
+
+\subsection*{Paraphrase attacks}
+
+\begin{algorithm}[H]\small
+\caption{DIPPER paraphrase attack (Krishna et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require paraphraser $P$ = T5-XXL (11B), lexical diversity $L$ and order diversity $O\in\{0,20,\dots,100\}$, prompt $x$, machine text $y$
+\Procedure{BuildTrainingData}{two translations $p,q$ of one novel} \Comment{6.3M pairs}
+ \State align sentences of $p$ and $q$ with Needleman--Wunsch, similarity = P-SP \Comment{dynamic programming}
+ \State choose a span $p_i..p_j$ and its aligned span $q_{i'}..q_{j'}$
+ \State $q^{sh}\gets$ random shuffle of the sentences $q_{i'}..q_{j'}$
+ \State $L\gets$ code from unigram-overlap F1 of $(p_i..p_j,\ q^{sh})$; \ $O\gets$ code from Kendall-$\tau$ of overlapping words
+ \State round $L,O$ to $\{0,20,\dots,100\}$ \Comment{$L{=}20\approx20\%$ of words changed}
+ \State example: input $=$ ``lexical$=L$, order$=O\ \oplus\ p_1..p_{i-1}\oplus$ <p> $q^{sh}$ </p> $\oplus\ p_{j+1}..p_N$'', target $=p_i..p_j$
+ \State fine-tune $P$ on all examples (max.\ 3 sentences per example)
+\EndProcedure
+\Procedure{Attack}{$x,y$}
+ \State split $y$ into blocks of 3 sentences
+ \For{each block $b$ in order}
+  \State input $\gets$ ``lexical$=L$, order$=O\ \ x\ $ <p> $b$ </p>'' \Comment{paper text is cut off here; presumably earlier paraphrased blocks are kept as context}
+  \State $b'\gets$ sample from $P(\text{input})$ with nucleus sampling, $p=0.75$
+ \EndFor
+ \State \Return concatenation of all $b'$
+\EndProcedure
+\pro{discourse-level and context-aware, so meaning is kept (88--99\% of paraphrases score above the median human paraphrase in P-SP); two knobs let the attacker change only as much as needed; DetectGPT accuracy 70.3\%$\to$4.6\% at 1\% FPR, KGW watermark 100\%$\to$57.2\% ($L{=}60,O{=}60$); the paraphraser must differ from the watermarked model, otherwise the paraphrase is watermarked too}
+\con{needs an 11B model; a single pass leaves the watermark only partly removed (57\% still detected); best results need several samples and a queryable detector; defeated by retrieval over the API's past outputs}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Recursive paraphrasing (Sadasivan et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require machine text $S=(s_1..s_n)$, optional context $C$, rounds $R$, paraphraser $f$ (DIPPER or LLaMA-2-7B-Chat: whole passage with context; Parrot T5: sentence by sentence), optional black-box detector $D$
+\Procedure{Recursive}{$S$}
+ \State $S_0\gets S$
+ \For{$r=1,\dots,R$}
+  \State $S_r\gets f_{strong}(S_{r-1},C)$ \textbf{or} $S_r\gets(f_{weak}(s_1),\dots,f_{weak}(s_n))$ \Comment{$S_r$ = ``pp$r$''}
+ \EndFor
+ \State \Return $S_R$
+\EndProcedure
+\Procedure{BestOfPP}{$S$} \Comment{needs black-box query access to $D$}
+ \State \Return $\arg\min_{r\in\{1..R\}}D(S_r)$ \Comment{paraphrase with the worst detector score}
+\EndProcedure
+\pro{each round keeps the previous one as input, so the watermark/style signal is removed gradually; OPT-13B watermark TPR@1\%FPR 99.8\%$\to$80.7\% (DIPPER) and 54.6\% (LLaMA-2); best-of-pp on OPT-1.3B 99.8\%$\to$4.0\%; also breaks the retrieval detector of Krishna et al.}
+\con{perplexity rises (5.5 $\to$ 8.7 / 10.5) and meaning drifts with rounds; short texts (50--100 tokens) are the easy case for the attacker, long texts keep more signal; best-of needs the detector}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Retrieval defense against paraphrasing (Krishna et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require LLM API $f_{LM}$, encoder $f_{ret}$ (P-SP, or BM25 with unigram-F1 normalisation), threshold $T$
+\Procedure{Log}{$x_i$} \Comment{API side, every request}
+ \State $y_i\gets f_{LM}(x_i)$; \ store $\mathbf y_i\gets f_{ret}(y_i)$ in database $\mathbf Y$ \Comment{up to 15M entries tested}
+\EndProcedure
+\Procedure{Detect}{$y'$}
+ \State $\mathbf y'\gets f_{ret}(y')$; \ $\mathit{score}\gets\max_i\ \mathrm{sim}(\mathbf y',\mathbf y_i)$ \Comment{exact copy gives 1.0}
+ \State \Return $\mathit{score}\ge T$
+\EndProcedure
+\pro{catches 80--97\% of paraphrased outputs at 1\% FPR; independent of text quality, so the impossibility argument does not apply}
+\con{needs the provider to store every output; privacy cost; broken by recursive paraphrasing (Sadasivan et al.) and spoofed 100\% of the time even with a private database}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Spoofing (the opposite goal: make human text look machine-made)}
+
+\begin{algorithm}[H]\small
+\caption{Watermark spoofing by learning a proxy green list (Sadasivan et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require query access to watermarked LM $M_{wm}$ (KGW), word set $W$ ($|W|=181$ most common words), $N=10^6$ queries
+\Procedure{LearnProxy}{}
+ \State $\mathit{count}[w][v]\gets0$ for all $w\in W,\ v\in W$
+ \For{each of $N$ generations $g$ from $M_{wm}$}
+  \For{each adjacent pair $(w,v)$ in $g$ with $w,v\in W$} \State $\mathit{count}[w][v]\gets\mathit{count}[w][v]+1$ \EndFor
+ \EndFor
+ \State $\tilde G_w\gets$ tokens $v$ with high $\mathit{count}[w][v]$ \Comment{rule not given in the text I read; see paper}
+\EndProcedure
+\Procedure{Spoof}{human author} \State write text whose token $v$ after $w$ is in $\tilde G_w$ as often as possible \EndProcedure
+\pro{one-off learning, then reusable; detector AUROC on spoofed text 99.8\%$\to$1.3\% (human text falsely flagged)}
+\con{only covers a small vocabulary subset; needs $10^6$ queries to the target; the same idea also gives a scrubbing recipe (avoid $\tilde G_w$)}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Adversarial perturbations of characters, words and embeddings}
+
+\begin{algorithm}[H]\small
+\caption{DeepWordBug (Gao et al.\ 2018; used on text detectors by Stiff \& Johansson 2022)}
+\begin{algorithmic}[1]
+\Require text $x=x_1x_2..x_n$ (words), black-box classifier score $F$, scoring function $S$, character transform $T$, edit budget $\epsilon$, $\lambda$
+\Function{Score}{$x_i;x$} \Comment{importance of word $i$ for the class decision}
+ \State \textbf{Replace-1:} $F(x_1..x_i..x_n)-F(x_1..x_i'..x_n)$ \Comment{$x_i'$ = replacement for $x_i$}
+ \State \textbf{Temporal Head:} $F(x_1..x_i)-F(x_1..x_{i-1})$
+ \State \textbf{Temporal Tail:} $F(x_i..x_n)-F(x_{i+1}..x_n)$
+ \State \textbf{Combined:} $\mathrm{THS}(x_i)+\lambda\,\mathrm{TTS}(x_i)$
+\EndFunction
+\Function{Transform}{word $w$} \Comment{returns the edit distance used}
+ \State pick one: \textbf{swap} two adjacent letters (cost 2) \textbf{or} \textbf{substitute} a letter by a random one \textbf{or} \textbf{delete} a random letter \textbf{or} \textbf{insert} a random letter (cost 1 each)
+\EndFunction
+\Procedure{DeepWordBug}{$x$}
+ \State $\mathit{scores}[i]\gets S(x_i;x)$ for $i=1..n$; \ sort indices by descending score: $L_1..L_n$
+ \State $x'\gets x$; \ $\mathit{cost}\gets0$; \ $j\gets1$
+ \While{$\mathit{cost}<\epsilon$}
+  \State $\mathit{cost}\gets\mathit{cost}+\textsc{Transform}(x'_{L_j})$; \ $j\gets j+1$ \Comment{edits the word in place}
+ \EndWhile
+ \State \Return $x'$
+\EndProcedure
+\pro{black-box, at most $O(n)$ queries; edits are tiny so a human still reads the text; halved the OpenAI RoBERTa detector's performance (Stiff \& Johansson)}
+\con{misspellings are easy to spot and to normalise with a spell-check; ordering signals (watermark green/red) are only hit if the edited word is scored}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Homoglyph and misspelling attacks (Wolff 2020)}
+\begin{algorithmic}[1]
+\Require text $y$, homoglyph map $H$ (e.g.\ Latin a $\to$ Cyrillic U+0430, e $\to$ U+0435), rate $\rho_h=1.5\%$ of characters, list $M$ of common human misspellings (Wikipedia), rate $\rho_m=5\%$ of words
+\Procedure{Homoglyph}{$y$}
+ \State choose $\rho_h|y|$ characters of the source letters at random; replace each by its look-alike from $H$
+ \State \Return $y'$ \Comment{looks identical, but the tokenizer sees different tokens}
+\EndProcedure
+\Procedure{Misspell}{$y$}
+ \State choose $\rho_m\cdot\#\text{words}$ words that appear in $M$ at random; replace each by a listed misspelling
+ \State \Return $y'$
+\EndProcedure
+\pro{no model needed, black-box, invisible (homoglyph) or human-like (misspelling); RoBERTa detector recall 97.44\%$\to$13.57\% with a/e Cyrillic at 1.5\% rate; replacing all occurrences: 0.26\% (homoglyph) and 22.68\% (misspelling), numbers as given in the survey}
+\con{normalising Unicode (NFKC does not map Cyrillic to Latin, a confusables table does) or spell-checking removes it; GLTR does not accept many Unicode characters, so only a restricted homoglyph set worked there}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{LLM word substitution against detectors (Shi et al.\ 2023, red teaming)}
+\begin{algorithmic}[1]
+\Require output $Y=[y_1..y_m]$, detector $f$ (classifier, KGW, or DetectGPT), helper LLM $G'$, budget $\epsilon$ (at most $\epsilon m$ words changed), $n$ candidates per word
+\Function{Candidates}{$y_k,Y$} \Comment{set of $\le n$ context-fitting words, may be empty}
+ \State \Return words from prompting $G'$: ``give $n$ substitution words that do not change the meaning of the sentence'' (ChatGPT); for LLaMA a completion ``Synonyms of the word $y_k$ in the above sentence are:''
+\EndFunction
+\Procedure{QueryBased}{$Y$} \Comment{needs black-box scores of $f$; solves $\min_{Y'}f(Y')$}
+ \State population $\gets$ copies of $Y$ with random words replaced by \textsc{Candidates}
+ \For{each generation} \State keep the elites (lowest $f$); build the next population by crossover of the elites \EndFor
+ \State \Return best element \Comment{evolutionary search of Alzantot et al.\ 2018; population size and number of generations not read}
+\EndProcedure
+\Procedure{QueryFree}{$Y$}
+ \If{$f$ is DetectGPT or a classifier} \State replace $\epsilon m$ random words using \textsc{Candidates}
+ \Else \Comment{KGW: target green tokens}
+  \State estimate the prediction entropy of every token with an LM $M$ (prefix or masked text)
+  \State replace the $\epsilon m$ highest-entropy tokens (they are the most likely to be green) using \textsc{Candidates}
+ \EndIf
+\EndProcedure
+\pro{LLM candidates fit the context, so no extra synonym filter; the KGW variant needs no detector query; text stays meaningful}
+\con{needs repeated queries to a helper LLM per text; query-based variant needs detector scores; effect bounded by the budget $\epsilon$}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Frankenstein, synonym and FGSM-embedding perturbations of Grover (Kulkarni et al.)}
+\begin{algorithmic}[1]
+\Require base article $a$ (keep its metadata: title, date, authors, URL strongly affect Grover), source articles, detector gradient access (FGSM part)
+\Procedure{Frankenstein}{$a$, source, fraction $q$}
+ \State split both into sentences (NLTK); choose random sentence indices in $a$ and in source
+ \State substitute (or insert) the chosen source sentences into $a$ until a fraction $q$ is replaced
+\EndProcedure
+\Procedure{SynonymSwap}{$a$} \State repeat $n$ times: replace one random word by a WordNet synonym, producing articles with $1,2,\dots,n$ swaps \EndProcedure
+\Procedure{FGSMTokenPairs}{article, steps $\epsilon\in\{0.001,0.1,1,5\}$}
+ \State $E\gets$ embedding table; \ $G\gets\partial\,\mathrm{loss}/\partial E$ for the article; \ $E^{adv}\gets E+\epsilon\cdot G$
+ \For{each token $t$ used in the article}
+  \State $v\gets\arg\max_{u}\ \cos(E_u,E^{adv}_t)$ over normalised embeddings
+  \If{$\cos>0.18$} \State add pair $(t\to v)$ to the replacement dictionary \EndIf
+ \EndFor
+ \State re-encode the article and replace the tokens in the dictionary
+\EndProcedure
+\pro{FGSM variant changed one or two tokens and fooled Grover in both directions (human$\to$machine and machine$\to$human); the substituted tokens are the same, so perplexity stays about the same}
+\con{requires gradient access to the detector (white-box); synonym swapping had no effect on Grover; a course report, not a peer-reviewed result}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Prompt attacks}
+
+\begin{algorithm}[H]\small
+\caption{SICO: substitution-based in-context example optimisation (Lu et al.\ 2024)}
+\begin{algorithmic}[1]
+\Require LLM, proxy detector giving $P_{AI}(\cdot)$, triplets $D=\{(x^k_{ic},y^k_{AI},y^k_{human})\}_{k=1}^K$, evaluation inputs $X_{eval}$, iterations $N$, task instruction $p_{task}$, paraphrase instruction $p_{para}$
+\Function{Utility}{prompt $p$} \State \Return $1-\frac1{|X_{eval}|}\sum_{x\in X_{eval}}P_{AI}\big(\mathrm{LLM}(p\oplus x)\big)$ \EndFunction
+\Function{GreedyOpt}{text $y$, substitutions $C$} \Comment{$C_{i,j}$ = $j$-th word or sentence substitute for unit $y_i$}
+ \State for each unit $y_i$: $C_{i,*}\gets\arg\min_jP_{AI}\big(\mathrm{SUB}(y_i,C_{i,j})\big)$ \Comment{best single substitution}
+ \State apply all best substitutions $C_{i,*}$ to $y$ one after another; \Return $y$
+\EndFunction
+\Procedure{SICO}{}
+ \State $t_{feature}\gets\mathrm{LLM}$ summary of how human text differs from AI text, from the pairs $(y^k_{AI},y^k_{human})$
+ \State $y^k_{ic}\gets\mathrm{LLM}(t_{feature}\oplus p_{para}\oplus y^k_{AI})$ for all $k$ \Comment{start from human-style paraphrases}
+ \State $p^*\gets t_{feature}\oplus p_{task}\oplus\{(x^k_{ic},y^k_{ic})\}$
+ \For{$n=1..N$}
+  \For{$k=1..K$}
+   \State $C^k\gets$ sentence-level (LLM paraphrases using $t_{feature}$) or word-level (WordNet synonyms, same POS, filtered by a masked LM) substitutions of $y^k_{ic}$, switching with $n$
+   \State $\hat y^k_{ic}\gets\textsc{GreedyOpt}(y^k_{ic},C^k)$
+  \EndFor
+  \State $\hat p\gets t_{feature}\oplus p_{task}\oplus\{(x^k_{ic},\hat y^k_{ic})\}$
+  \If{\textsc{Utility}$(\hat p)>$ \textsc{Utility}$(p^*)$} \State $y^k_{ic}\gets\hat y^k_{ic}$; \ $p^*\gets\hat p$ \EndIf
+ \EndFor
+ \State \Return $p^*$ \Comment{reusable prompt template; at test time put any task input $x$ after it}
+\EndProcedure
+\pro{no fine-tuning, works on a black-box LLM; average AUC drop of 0.54 and better text quality than paraphrase attacks (survey summary of the paper); \emph{SICO-Para} reuses it as a paraphraser}
+\con{needs a proxy detector and many LLM calls during the one-off optimisation; transfer to other detectors is imperfect; training detectors on SICO outputs restores much of the performance (Sec.~6.1 of the paper)}
+\end{algorithmic}
+\end{algorithm}
+The survey spells the name ``Substitution-based Contextual Example Optimization''; the paper's title uses \emph{in-context} and the abbreviation is SICO.
+
+\begin{algorithm}[H]\small
+\caption{Instructional-prompt attack (Shi et al.\ 2023, red teaming)}
+\begin{algorithmic}[1]
+\Require generator $G$ (ChatGPT), black-box detector $f$, $n$ training prompts $X_1..X_n$, top-$K$ $K$, iterations $T$
+\Procedure{SearchPrompt}{}
+ \State $X_{ins}\gets$ ``Meanwhile please imitate the writing style and wording of the following passage:''; \ $X_{ref}\gets\emptyset$
+ \State queue $O\gets$ the $n$ outputs of $G$ without suffix, sorted by detector score $f$ (lowest first)
+ \For{$t=1..T$}
+  \State \textbf{update $X_{ref}$:} pop the $K$ best texts from $O$; candidates $X_p=[X_{ins},\text{text}]$
+  \State \textbf{update $X_{ins}$:} ask $G$ for $K$ rewrites of $X_{ins}$; candidates $X_p=[\text{rewrite},X_{ref}]$
+  \State keep the candidate minimising $\frac1n\sum_if\big(G([X_i,X_p])\big)$; push all its outputs into $O$
+  \State discard candidates for which more than 20\% of the (non-stop) words of $X_{ref}$ appear in the output \Comment{copy guard}
+ \EndFor
+ \State \Return $X_p=[X_{ins},X_{ref}]$
+\EndProcedure
+\Procedure{Attack}{$X$} \State \Return $G([X,X_p])$ \Comment{test time: no detector queries} \EndProcedure
+\pro{query-free at test time; one prompt works for a whole dataset; no change to the generated text itself, only to the input}
+\con{search needs many detector queries; only tested on instruction-following LLMs against classifier-based detectors; style is imitated, so content is not guaranteed to match the original}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Training threat models}
+
+\begin{algorithm}[H]\small
+\caption{EScaPe: evasive soft prompts (Kumarage et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require frozen source LM $PLM^s$ (policy $\pi$), proxy detector $d_\phi$, writing prompts $X$, $k$ trainable virtual tokens $P^s=(p_1..p_k)$, $p_i\in\mathbb R^{e_s}$, penalty $\beta$
+\Procedure{LearnSoftPrompt}{}
+ \For{each PPO step}
+  \State $Y\gets PLM^s([P^s;\ \mathrm{emb}(X)])$ \Comment{virtual tokens prepended to the prompt embeddings}
+  \State $\hat z\gets d_\phi(Y)[\text{Human}]$ \Comment{probability that the detector says human}
+  \State $R\gets\hat z-\beta\,\mathrm{KL}(\pi\,\|\,PLM^s)$ \Comment{KL keeps the text coherent and on topic}
+  \State update only $P^s$ by the PPO policy gradient with reward $R$
+ \EndFor
+\EndProcedure
+\Procedure{Transfer}{target LM $PLM^t$}
+ \State $P^t\gets g_\theta(P^s)=W_2\,\sigma(W_1P^s+b_1)+b_2$ \Comment{2-layer projector $\mathbb R^{e_s}\to\mathbb R^{e_t}$, trained with the same RL loop (my reading of Eq.~7)}
+\EndProcedure
+\pro{only $k$ embeddings are trained, the LM stays frozen; transfers across LMs and across detectors; DetectGPT and OpenAI detector AUROC down by up to 40\% (survey summary)}
+\con{needs a proxy detector and RL training per source model; soft prompts need access to the LM's embeddings (open weights); the quality of the evasive text is lower than the original}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]\small
+\caption{Fine-tuning against a detector, ``hide and seek'' (Da Silva Gameiro Henrique et al.\ 2023)}
+\begin{algorithmic}[1]
+\Require generator $G$ = GPT-2 small (117M), discriminator $D$ = BERT base (110M), human reference corpus $H$ (the data $D$ was trained on), prompts = first 5 tokens of corpus entries
+\Procedure{HideAndSeek}{}
+ \Repeat
+  \State $y\gets G(\text{prompt})$ for a batch of prompts from $H$
+  \State train $D$ to separate $H$ (human) from $y$ (machine)
+  \State update $G$ by reinforcement from the critic $D$ \Comment{AdamW instead of Adam; best of five restarts; exact reward form not read}
+ \Until{converged}
+\EndProcedure
+\pro{shows that if the attacker has the human data the detector was trained on, fine-tuning on that data makes the detector fail \emph{even though all its labels are correct}}
+\con{small models and small datasets (MS COCO captions, EMNLP news); DP-GAN with RNNs collapses and was ruled out; the result assumes access to $D$'s reference data}
+\end{algorithmic}
+\end{algorithm}
+
+\subsection*{Survey-level attacks (original papers not read)}
+The survey lists these without algorithms; I could not fetch the originals, so treat the lines as pointers, not as exact procedures.
+\begin{algorithm}[H]\small
+\caption{Attacks only described in Wu et al.\ Sec.~8.2}
+\begin{algorithmic}[1]
+\Procedure{Cutoff}{} (Shen et al.\ 2020) \State crop part of the input or of its feature vector \EndProcedure
+\Procedure{Shuffle}{} (Lee et al.\ 2020) \State randomly reorder the words of the input \EndProcedure
+\Procedure{Mutation}{} (Liang et al.\ 2023) \State change characters or words \EndProcedure
+\Procedure{WordSwap}{} (Shi \& Huang 2020; Ren et al.\ 2019 PWWS; Crothers et al.\ 2022) \State replace words by contextually fitting ones, ranked by saliency $\times$ probability change \Comment{PWWS formula from memory, not verified} \EndProcedure
+\Procedure{TextAttack}{} (Morris et al.\ 2020) \State attack $=$ objective function + constraints + transformation + search method \EndProcedure
+\Procedure{Syntax}{} (Bhat \& Parthasarathy 2020) \State split long sentences, drop definite articles, expand contractions (``that's'' $\to$ ``that is''), reformat paragraphs \EndProcedure
+\Procedure{WeightedSaliency}{} (He et al.\ 2023b, MGTBench) \State probability-weighted word saliency to build adversarial examples that keep the meaning \EndProcedure
+\Procedure{RLEvasion}{} (Nicks et al.\ 2023; Schneider et al.\ 2023) \State fine-tune Llama-2-7B / a generator with detector ``humanity'' scores as reward; OpenAI RoBERTa AUROC 0.84$\to$0.62 (Nicks), BERT-based classifier down to 0.15 (Schneider) \EndProcedure
+\Procedure{PromptComplexity}{} (Guo et al.\ 2023; Liu et al.\ 2023e) \State complex or varied prompts (few-shot, CoT) lower the detector's recall \EndProcedure
+\Procedure{AdvTrainingDefense}{} (Antoun et al.\ 2023) \State train the detector on adversarial samples; this improves its recognition of the attack \EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{What this means for the thesis (my synthesis, not from the sources).} Paraphrase and word-substitution attacks act on token identity and order, so they hit token-level watermarks (KGW, Unigram) first; sentence-level watermarks (SemStamp) and EXP-EDIT alignment should lose less; homoglyph and character attacks change the tokenisation, so they hit both watermark detection and perplexity-based fingerprints but are removed by Unicode normalisation; prompt and training attacks shift the style and so target stylometric and likelihood-based fingerprints rather than the key-based watermark. The experiments should run each attack at several strengths (paraphrase rounds $R$, edit budget $\epsilon$, diversity codes $L,O$) and report TPR at 1\% and 0.1\% FPR per signal and fused.
+
+\section{Article summaries}
+% One subsection per paper: citation, claim, method, results, limitations, relevance to thesis.
+
+\section{Ideas and future research}
+
+\end{document}
