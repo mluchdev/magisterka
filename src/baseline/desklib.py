@@ -33,13 +33,18 @@ def _load():
     return tokenizer, model, device
 
 
+def desklib_detect_batch(texts: list[str], max_len: int = 768) -> list[float]:
+    """Return the probability (0-1) that each text is AI-generated."""
+    tokenizer, model, device = _load()
+    enc = tokenizer(texts, truncation=True, max_length=max_len, padding=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        logits = model(enc["input_ids"], enc["attention_mask"])
+    return torch.sigmoid(logits).squeeze(-1).tolist()
+
+
 def desklib_detect(text: str, max_len: int = 768) -> float:
     """Return the probability (0-1) that `text` is AI-generated."""
-    tokenizer, model, device = _load()
-    enc = tokenizer(text, truncation=True, max_length=max_len, return_tensors="pt").to(device)
-    with torch.no_grad():
-        logit = model(enc["input_ids"], enc["attention_mask"])
-    return torch.sigmoid(logit).item()
+    return desklib_detect_batch([text], max_len)[0]
 
 
 if __name__ == "__main__":

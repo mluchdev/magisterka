@@ -955,6 +955,49 @@ The survey lists these without algorithms; I could not fetch the originals, so t
 \section{Article summaries}
 % One subsection per paper: citation, claim, method, results, limitations, relevance to thesis.
 
+\subsection{Ko et al.: ATLAS and MAABench (model authorship attribution)}
+Ko, Lee, Song, Kim, Shin, Kim (KAIST), \emph{Who's Behind the Text? Robust Model Authorship Attribution}; \texttt{articles/pdfs/ko\_bench.pdf}. Venue and year are not stated in the PDF, so check before citing; the references run into 2026.
+
+\paragraph{Claim.} Model authorship attribution (MAA: which model \emph{family} wrote a text) is near-saturated in-distribution, but existing methods lose about 28 points (best baseline, version shift) to 35 points (joint shift) when the model version changes, and little (about 4 points) under domain shift alone. A source-conditioned likelihood method (ATLAS) degrades less, and the paper adds a benchmark (MAABench) that tests exactly these shifts.
+
+\paragraph{Method (ATLAS).} Frozen backbone (Qwen2.5-7B). For each of $K$ source families a learnable prefix embedding plus a source-specific LoRA up-projection (shared down-projection) is trained to \emph{maximise the text likelihood} under its own family; no classification loss is used. At inference every text is scored under all $K$ conditions. For each token, the likelihood under condition $k$ is compared with each competitor and the ratio is clipped at 1, so $r_{k,t}\in(0,1]$ and no single token can dominate; $R_k$ is the mean over tokens and temperatures, prediction is $\arg\max_k R_k$. Ablation (version shift): per-source $B_k$ +2.2 points, clipping a further +4.6 points (+5.1 joint).
+
+\paragraph{MAABench (new).} Five families (GPT, Claude, Gemini, Mistral, Llama), 4 versions each; the oldest is for training, the other 3 for test. Six domains, prompts built only from the metadata of a human text (never the text itself), the same prompt for every family, 90--220 words, temperature 0.7, 512 tokens max, validity filter after Fu et al.\ (2025); a seed is kept only if all families pass. 228,520 machine and 35,443 human texts. Splits: ID (the 4 training domains, training version); \emph{Domain shift} (Patents and Stack Exchange, persona system prompt, same versions); \emph{Version shift} (training domains, 3 newer versions); \emph{Joint} (both).
+
+\begin{table}[H]\centering\footnotesize
+\begin{tabular}{@{}lll@{}}
+\hline
+Domain & Corpus & Role \\ \hline
+News & XSum & ID \\
+Wikipedia & English Wikipedia dump (2023-11-01) & ID \\
+Academic & arXiv abstracts (2021) & ID \\
+Reviews & Amazon Reviews 2023 & ID \\
+Patents & HUPD & unseen \\
+Q\&A & Stack Exchange dump & unseen \\ \hline
+\end{tabular}
+\caption{MAABench human corpora (8,500 seeds per ID domain, 750 per unseen domain; the human text is the human class).}
+\end{table}
+
+\paragraph{Results (accuracy, \%).}
+\begin{table}[H]\centering\footnotesize
+\begin{tabular}{@{}lrrrr@{}}
+\hline
+ & ID & Domain & Version & Joint \\ \hline
+Fast-DetectGPT & 44.4 & 45.3 & 35.2 & 31.9 \\
+Binoculars & 45.6 & 46.5 & 36.1 & 32.6 \\
+Best trained baseline & 99.6 & 95.3 & 72.0 & 65.3 \\
+ATLAS & 99.7 & 98.0 & 84.3 & 74.3 \\ \hline
+\end{tabular}
+\caption{MAA on MAABench (Table 2 of the paper; ``best trained baseline'' = best of DeTeCtive, OTBDetector, DA-MTL, Idiosyncrasies per column).}
+\end{table}
+On OpenTuringBench (news, 7 open models of 3.8--10.7B, tasks E1--E5) ATLAS reaches 95.7\% on the essay-domain OOD task against 62.2\% for the best baseline; on E4 (human--machine mixing) every method stays low (ATLAS 41.9\%, best baseline 32.4\%). As a by-product the same likelihoods work as a human-vs-machine detector (AUROC 99.75\% joint shift when trained on MAABench; off-the-shelf Fast-DetectGPT/Binoculars/ReMoDetect/IRM 50.7--82.3\%). Distillation: all 6 distilled students were traced to their known teacher family (63--94\%), and 4 of 7 deployed models resemble one family in 85--94\% of texts (reported as resemblance, not proof of distillation).
+
+\paragraph{Datasets named in the paper (for the benchmark chapter).} MAABench (new, above); OpenTuringBench (La Cava \& Tagarelli 2025; news from 7 open models plus human, 264,321 training texts, tasks E0--E5 above); XSum, Wikipedia, arXiv abstracts, Amazon Reviews 2023, HUPD, Stack Exchange as human sources. MAABench has no watermarked generators, no adversarial attacks and no Polish text, and generation is a single run at temperature 0.7 with reasoning off.
+
+\paragraph{Limitations (authors').} Fixed closed set of candidate families, no unseen-family or open-set handling; no mixed human--machine authorship. \emph{Mine:} no attacks (paraphrase, translation, homoglyphs) are applied, so robustness there means distribution shift only; macro-F1 and accuracy are reported for MAA, and TPR@1\%FPR only for the secondary detection task; the table shows single runs for the non-encoder baselines. Dates and model names (GPT-5.6, Opus 5) come from the paper and I have not checked them.
+
+\paragraph{Relevance.} Pillar~1: a ready-made fingerprinting baseline whose strength is exactly the shift-robustness we want to test; its source-conditioned log-likelihood score is a natural input for the fusion model. Pillar~3: the Version/Domain/Joint split protocol can be reused for our before/after-attack evaluation, and the weak E4 result shows that mixed authorship is the open problem. Gap this leaves for the thesis: add watermarked generators and attacks to the same kind of shift protocol, and report low-FPR metrics.
+
 \section{Ideas and future research}
 
 \end{document}

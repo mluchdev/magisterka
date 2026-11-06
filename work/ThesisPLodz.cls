@@ -431,7 +431,7 @@
 % Bibliografia
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \newcommand{\bibliographyfile}[1]{\renewcommand{\@bibliographyfile}{#1}}
-\bibliographystyle{apalike}
+\bibliographystyle{plainnat}
 
 % Pogrubienie autora pracy w bibliografii
 \RequirePackage{xstring}
