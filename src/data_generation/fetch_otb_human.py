@@ -5,7 +5,7 @@ each text also gets the header the machine texts have: "<title>\\n\\n<Month D, Y
 date from article:published_time in US Eastern). Resumable; appends to data/openturingbench/human_<split>.jsonl
 ({"url", "content", "model": "human"} per line). Failures (HTTP != 200, no body or title/date) go to
 human_<split>_failed.txt and are skipped on re-run.
-Run: uv run python src/data/fetch_otb_human.py [split ...]   (test | val | train, default all three in that order)
+Run: uv run python src/data_generation/fetch_otb_human.py [split ...]   (test | val | train, default all three in that order)
 """
 
 import json
@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup
 from huggingface_hub import hf_hub_download
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
-from data.openturingbench import DATASET_ID, HUMAN_DIR
+from data_generation.openturingbench import DATASET_ID, HUMAN_DIR
 
 WORKERS = 4  # each worker sleeps 1 s after a request, so ~4 requests/s at most
 

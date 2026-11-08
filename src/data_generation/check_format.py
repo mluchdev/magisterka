@@ -1,7 +1,7 @@
 """Formatting check of OpenTuringBench test: do human and machine texts differ in surface format (not style)?
 
 Prints the first 300 chars of a few texts per class, then per-class rates of simple format cues.
-Run: uv run python src/data/check_format.py
+Run: uv run python src/data_generation/check_format.py
 """
 
 import re
@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
-from data.openturingbench import OTBDataset
+from data_generation.openturingbench import OTBDataset
 
 DATE = re.compile(r"^(January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}, \d{4}\s*$", re.M)
 CUES = {

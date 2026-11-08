@@ -5,10 +5,26 @@ build/
 dist/
 wheels/
 data/
+
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.lof
+*.lol
+*.lot
+*.toc
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+
 *.egg-info
 
 # Virtual environments
 .venv
 articles/*/
-.venv-giga/
-checkpoints/
+.venv-vllm/

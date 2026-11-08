@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
 from baseline.desklib import MODEL_ID, desklib_detect_batch
-from data.openturingbench import otb_loader
+from data_generation.openturingbench import otb_loader
 
 SPLIT = "test"
 THRESHOLD = 0.5

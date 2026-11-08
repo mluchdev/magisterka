@@ -90,7 +90,7 @@ Duże modele językowe
             \item mutation -- replacing characters with visually similar ones from another alphabet (e.g., Latin \textit{e} $\rightarrow$ Cyrillic \textit{е}), or swapping words with semantically related ones that fit the same context (``apple'' $\rightarrow$ ``orange'') \cite{liang2023}. The character-level part of this category is represented in \cite{dugan2024} by four attacks: homoglyph (with the set of lookalike characters introduced by \cite{wolff2020}), inserting the zero-width space after every other character, adding whitespace between characters and swapping the case of words.
             \item word swapping -- substitude context appropriate words \cite{shi2024}. \cite{dugan2024} implement it as synonym swap, where tokens are replaced by highly similar candidates proposed by BERT, and as number swap, which randomly shuffles digits inside numbers,
             \item insert common misspellings \cite{dugan2024},
-            \item probability word saliency,
+            \item probability word saliency -- synonym swapping where the order of replaced words depends on word saliency and classification probability \cite{ren2019}; it generates adversarial examples that better keep semantic similarity \cite{wu2025},
             \item common syntactic changes (``that's'' $\rightarrow$ ``that is''). In \cite{dugan2024} these are article deletion (removing ``the'', ``a'', ``an''), replacing American spelling with the British one and inserting paragraph breaks between sentences.
         \end{enumerate}
         \item Prompt attacks.
