@@ -28,3 +28,4 @@ data/
 .venv
 articles/*/
 .venv-vllm/
+wandb/

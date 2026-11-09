@@ -1,13 +1,3 @@
-"""Scrape the human-written HuffPost articles of OpenTuringBench (the HF repo ships only machine texts).
-
-URL list and body extraction are the authors' (scripts/human_urls.json, scripts/fetch_human_data.py). Unlike theirs,
-each text also gets the header the machine texts have: "<title>\\n\\n<Month D, YYYY>\\n\\n<body>" (title from h1.headline,
-date from article:published_time in US Eastern). Resumable; appends to data/openturingbench/human_<split>.jsonl
-({"url", "content", "model": "human"} per line). Failures (HTTP != 200, no body or title/date) go to
-human_<split>_failed.txt and are skipped on re-run.
-Run: uv run python src/data_generation/fetch_otb_human.py [split ...]   (test | val | train, default all three in that order)
-"""
-
 import json
 import re
 import sys
@@ -28,10 +18,14 @@ from data_generation.openturingbench import DATASET_ID, HUMAN_DIR
 WORKERS = 4  # each worker sleeps 1 s after a request, so ~4 requests/s at most
 
 
-def clean_text(text):
-    text = re.sub(r"\n\s*\n", "\n", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def squash(text):
+    """All whitespace runs -> one space (the authors' extractor)."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def url_key(url):
+    """Identifier shared with the machine rows."""
+    return Path(urlparse(url).path).name
 
 
 def extract_article(html):
@@ -41,17 +35,15 @@ def extract_article(html):
     h1, meta = soup.find("h1", class_="headline"), soup.find("meta", property="article:published_time")
     if not (section and h1 and meta):
         return ""
-    paragraphs = [p for div in section.find_all("div", class_="primary-cli cli cli-text") for p in div.find_all("p")]
-    body = "\n\n".join(clean_text(p.get_text()) for p in paragraphs if clean_text(p.get_text()) != "Also on HuffPost:")
+    paragraphs = [squash(p.get_text()) for div in section.find_all("div", class_="primary-cli cli cli-text") for p in div.find_all("p")]
+    body, title = "\n\n".join(p for p in paragraphs if p != "Also on HuffPost:"), squash(h1.get_text())
     when = datetime.fromisoformat(meta["content"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
-    if not body or not clean_text(h1.get_text()):
-        return ""
-    return f"{clean_text(h1.get_text())}\n\n{when:%B} {when.day}, {when.year}\n\n{body}"
+    return f"{title}\n\n{when:%B} {when.day}, {when.year}\n\n{body}" if body and title else ""
 
 
 def fetch(url):
     """(key, text, status); text is '' on failure, status None on a network error (retried on the next run)."""
-    key = Path(urlparse(url).path).name  # identifier shared with the machine rows
+    key = url_key(url)
     try:
         r = requests.get(url, timeout=30)
     except requests.RequestException as e:
@@ -70,7 +62,7 @@ def main(split):
         done |= {json.loads(l)["url"] for l in out.read_text().splitlines() if l}
     if failed.exists():
         done |= {l.split("\t")[0] for l in failed.read_text().splitlines() if l}
-    todo = [u for u in urls if Path(urlparse(u).path).name not in done]
+    todo = [u for u in urls if url_key(u) not in done]
     print(f"{split}: {len(urls)} urls, {len(done)} already done, {len(todo)} to fetch", flush=True)
 
     with open(out, "a") as fo, open(failed, "a") as ff, ThreadPoolExecutor(WORKERS) as pool:

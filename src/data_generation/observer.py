@@ -1,20 +1,3 @@
-"""Observer: Nemotron reads whole OpenTuringBench articles and we save its next-token probabilities.
-
-Per article: (1) Nemotron writes a detailed summary of it (key people, places, dates, numbers, events), so that the facts
-are known and do not surprise it later; (2) in a fresh context that holds ONLY that summary (wrapped in WRAP), the whole
-article is fed as the answer (teacher forcing) and for every token we record the 20 highest next-token probabilities
-(descending) + the probability of the actual token = 21 numbers. Probabilities are exp(log-prob) from the model's
-full-vocabulary distribution (no renormalisation, so the top 20 sum to < 1).
-
-Files in data/observer/ (one growing pair per split, resumable):
-  <split>.npy         float32 (n_tokens, 21); rows [row_start, row_end) of an article are in the index
-  <split>_index.csv   text_id (test_<n>, n = position in the fixed shuffled order of the split's texts), url, model, label,
-                      row_start, row_end, truncated, prompt (the summary), text
-  <split>_meta.json   model, prompt variant, seed (a resume must match them)
-Ctrl+C saves and exits; running again continues after the last finished chunk of texts.
-Run (needs vLLM, so the vllm venv): .venv-vllm/bin/python src/data_generation/observer.py [split] [n_texts]
-"""
-
 import csv
 import json
 import os
@@ -22,6 +5,7 @@ import random
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("CUDA_HOME", "/opt/cuda")  # vLLM/FlashInfer compile kernels with nvcc
@@ -33,10 +17,10 @@ import numpy as np
 from vllm import LLM, SamplingParams
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
-from data_generation.openturingbench import OTBDataset
+from common import DATA, OBSERVER_MODEL
+from data_generation.openturingbench import load_otb
 
-MODEL_ID = "nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8"
-OUT = Path(__file__).parent.parent.parent / "data" / "observer"
+OUT = DATA / "observer"
 TOP_K, MAX_TEXT_TOKENS, MAX_SUMMARY_TOKENS, SAVE_EVERY_S, SEED = 20, 5000, 400, 300, 0
 # memory settings, overridable by run_observer.py, which lowers them after an out-of-memory crash
 GPU_UTIL = float(os.environ.get("OBS_GPU_UTIL", 0.74))
@@ -44,90 +28,116 @@ BATCHED_TOKENS = int(os.environ.get("OBS_BATCHED_TOKENS", 256))
 MAX_SEQS = int(os.environ.get("OBS_MAX_SEQS", 4))
 CHUNK_TEXTS = int(os.environ.get("OBS_CHUNK", 8))
 NO_THINK = {"enable_thinking": False}
-CONTROL = "Write a news article."  # variant "none": the same generic prompt for every article
 RULES = "Do not copy sentences. Do not add any names, numbers, dates or facts that are not in the article. Reply with the summary only."
-PROMPTS = {
-    "summary": "Write a detailed summary (120-180 words) of the following article. Include the key facts: who, what, where, "
-               "when, names, organizations, places, numbers and dates. " + RULES + "\n\nArticle:\n{}",
-    "brief": "Summarize the following article in at most 30 words. " + RULES + "\n\nArticle:\n{}",
+WRAP = "Write a news article based on this summary.\n\nSummary: {}"
+# variant -> (prompt asking for the summary, or None = the fixed text CONTROL for every article; template of the scoring context)
+CONTROL = "Write a news article."
+VARIANTS = {
+    "summary": ("Write a detailed summary (120-180 words) of the following article. Include the key facts: who, what, where, "
+                "when, names, organizations, places, numbers and dates. " + RULES + "\n\nArticle:\n{}", WRAP),
+    "brief": ("Summarize the following article in at most 30 words. " + RULES + "\n\nArticle:\n{}", WRAP),
+    "none": (None, "{}"),
 }
 VARIANT = "summary"
-WRAP = "Write a news article based on this summary.\n\nSummary: {}"
+HEADER = ["text_id", "url", "model", "label", "row_start", "row_end", "truncated", "prompt", "text"]
 
 
-def load_llm():
-    # max_num_batched_tokens: the logits of a chunk (x 131k vocab x 4 B) must fit next to the weights on the 8 GB GPU
-    llm = LLM(MODEL_ID, max_model_len=6144, gpu_memory_utilization=GPU_UTIL, max_num_seqs=MAX_SEQS, max_num_batched_tokens=BATCHED_TOKENS,
-              trust_remote_code=True, mamba_ssm_cache_dtype="float32", kv_cache_dtype="fp8", enforce_eager=True,
-              logprobs_mode="raw_logprobs")
-    return llm, llm.get_tokenizer()
+@dataclass
+class Observer:
+    """Nemotron (vLLM). Per article: a summary (variant's prompt, greedy), then the article teacher-forced after a fresh
+    context holding only that summary; per token 21 floats = top-20 next-token p (descending) + p(actual token)."""
+    variant: str = VARIANT
+
+    def __post_init__(self):
+        # max_num_batched_tokens: the logits of a chunk (x 131k vocab x 4 B) must fit next to the weights on the 8 GB GPU
+        self.llm = LLM(OBSERVER_MODEL, max_model_len=6144, gpu_memory_utilization=GPU_UTIL, max_num_seqs=MAX_SEQS,
+                       max_num_batched_tokens=BATCHED_TOKENS, trust_remote_code=True, mamba_ssm_cache_dtype="float32",
+                       kv_cache_dtype="fp8", enforce_eager=True, logprobs_mode="raw_logprobs")
+        self.tok = self.llm.get_tokenizer()
+
+    def cut(self, text):
+        """(text cut to MAX_TEXT_TOKENS tokens, its token ids, whether it was cut)."""
+        ids = self.tok(text, add_special_tokens=False)["input_ids"]
+        if len(ids) <= MAX_TEXT_TOKENS:
+            return text, ids, False
+        return self.tok.decode(ids[:MAX_TEXT_TOKENS]), ids[:MAX_TEXT_TOKENS], True
+
+    def summarize(self, texts):
+        prompt = VARIANTS[self.variant][0]
+        if prompt is None:
+            return [CONTROL] * len(texts)
+        chats = [[{"role": "user", "content": prompt.format(t)}] for t in texts]
+        outs = self.llm.chat(chats, SamplingParams(temperature=0, max_tokens=MAX_SUMMARY_TOKENS), chat_template_kwargs=NO_THINK)
+        return [o.outputs[0].text.strip() for o in outs]
+
+    @staticmethod
+    def token_row(logprobs, token_id):
+        top = sorted((v for v in logprobs.values() if v.rank <= TOP_K), key=lambda v: v.rank)  # drops the actual token if it ranks lower
+        row = np.zeros(TOP_K + 1, dtype=np.float32)
+        row[: len(top)] = np.exp([v.logprob for v in top])
+        row[TOP_K] = np.exp(logprobs[token_id].logprob)
+        return row
+
+    def score(self, summaries, ids_list):
+        """Per article an array (n_tokens, 21)."""
+        wrap = VARIANTS[self.variant][1]
+        prefixes = [self.tok(self.tok.apply_chat_template([{"role": "user", "content": wrap.format(s)}], tokenize=False,
+                                                          add_generation_prompt=True, **NO_THINK), add_special_tokens=False)["input_ids"]
+                    for s in summaries]
+        outs = self.llm.generate([{"prompt_token_ids": p + i} for p, i in zip(prefixes, ids_list)],
+                                 SamplingParams(max_tokens=1, prompt_logprobs=TOP_K))
+        return [np.stack([self.token_row(o.prompt_logprobs[len(p) + k], t) for k, t in enumerate(i)])
+                for o, p, i in zip(outs, prefixes, ids_list)]
+
+    def __call__(self, texts):
+        """[(summary, array (n_tokens, 21), truncated)] per text."""
+        cuts = [self.cut(t) for t in texts]
+        summaries = self.summarize([t for t, _, _ in cuts])
+        return list(zip(summaries, self.score(summaries, [i for _, i, _ in cuts]), [c for _, _, c in cuts]))
 
 
-def cut(tok, text):
-    """(text cut to MAX_TEXT_TOKENS tokens, its token ids, whether it was cut)."""
-    ids = tok(text, add_special_tokens=False)["input_ids"]
-    if len(ids) <= MAX_TEXT_TOKENS:
-        return text, ids, False
-    return tok.decode(ids[:MAX_TEXT_TOKENS]), ids[:MAX_TEXT_TOKENS], True
+@dataclass
+class ObserverStore:
+    """data/observer/<split>.npy (float32 (n_tokens, 21)) + <split>_index.csv (HEADER; rows [row_start, row_end) of the
+    .npy) + <split>_meta.json (settings; a resume must match them). Resumes from existing files; saves atomically."""
 
+    split: str
+    META = {"model": OBSERVER_MODEL, "variant": VARIANT, "seed": SEED, "top_k": TOP_K, "max_text_tokens": MAX_TEXT_TOKENS, "labels_cut": True}
 
-def ask(llm, texts, variant=VARIANT):
-    """One summary per article (greedy)."""
-    if variant == "none":
-        return [CONTROL] * len(texts)
-    chats = [[{"role": "user", "content": PROMPTS[variant].format(t)}] for t in texts]
-    outs = llm.chat(chats, SamplingParams(temperature=0, max_tokens=MAX_SUMMARY_TOKENS), chat_template_kwargs=NO_THINK)
-    return [o.outputs[0].text.strip() for o in outs]
+    def __post_init__(self):
+        OUT.mkdir(parents=True, exist_ok=True)
+        self.npy, self.csv, self.meta = (OUT / f"{self.split}{x}" for x in (".npy", "_index.csv", "_meta.json"))
+        self.rows, self.index = [], []
+        if self.meta.exists():
+            assert json.loads(self.meta.read_text()) == self.META, f"{self.meta} was made with other settings, delete it or fix them"
+            self.index = list(csv.reader(open(self.csv)))[1:]
+            self.rows = [np.load(self.npy)[: self.n_rows]] if self.index else []  # drop rows of a save interrupted between the files
+            print(f"resuming: {len(self.index)} texts done", flush=True)
 
+    @property
+    def n_rows(self):
+        return int(self.index[-1][HEADER.index("row_end")]) if self.index else 0
 
-def token_row(logprobs, token_id):
-    """21 floats: probabilities of the TOP_K most likely tokens (descending), then of the actual token."""
-    top = sorted((v for v in logprobs.values() if v.rank <= TOP_K), key=lambda v: v.rank)  # drops the actual token if it ranks lower
-    row = np.zeros(TOP_K + 1, dtype=np.float32)
-    row[: len(top)] = np.exp([v.logprob for v in top])
-    row[TOP_K] = np.exp(logprobs[token_id].logprob)
-    return row
+    def add(self, arr, **fields):
+        """fields: every HEADER column except row_start/row_end."""
+        fields |= {"row_start": self.n_rows, "row_end": self.n_rows + len(arr)}
+        self.index.append([fields[h] for h in HEADER])
+        self.rows.append(arr)
 
-
-def score(llm, tok, summaries, ids_list, variant=VARIANT):
-    """Per article an array (n_tokens, 21): the article is the answer to a context that holds only its summary."""
-    batch = []
-    for summary, ids in zip(summaries, ids_list):
-        msg = summary if variant == "none" else WRAP.format(summary)
-        prefix = tok(tok.apply_chat_template([{"role": "user", "content": msg}], tokenize=False,
-                     add_generation_prompt=True, **NO_THINK), add_special_tokens=False)["input_ids"]
-        batch.append((prefix, ids))
-    outs = llm.generate([{"prompt_token_ids": p + i} for p, i in batch],
-                        SamplingParams(max_tokens=1, prompt_logprobs=TOP_K))
-    return [np.stack([token_row(o.prompt_logprobs[len(p) + k], t) for k, t in enumerate(i)])
-            for o, (p, i) in zip(outs, batch)]
+    def save(self):  # atomic: a Ctrl+C during saving cannot corrupt the files
+        for path, mode, write in ((self.npy, "wb", lambda f: np.save(f, np.concatenate(self.rows))),
+                                  (self.csv, "w", lambda f: csv.writer(f).writerows([HEADER, *self.index]))):
+            tmp = path.with_name(path.name + ".tmp")
+            with open(tmp, mode, newline=None if mode == "wb" else "") as f:
+                write(f)
+            os.replace(tmp, path)
+        self.meta.write_text(json.dumps(self.META))
 
 
 def main(split="test", n_texts=None):
-    OUT.mkdir(parents=True, exist_ok=True)
-    npy, csv_path, meta_path = OUT / f"{split}.npy", OUT / f"{split}_index.csv", OUT / f"{split}_meta.json"
-    meta = {"model": MODEL_ID, "variant": VARIANT, "seed": SEED, "top_k": TOP_K, "max_text_tokens": MAX_TEXT_TOKENS, "labels_cut": True}
-    header = ["text_id", "url", "model", "label", "row_start", "row_end", "truncated", "prompt", "text"]
-
-    items = OTBDataset(split).items
+    items = load_otb(split)
     order = random.Random(SEED).sample(range(len(items)), len(items))[:n_texts]  # fixed order: any prefix is a random sample
-    rows, index = [], []
-    if meta_path.exists():  # resume
-        assert json.loads(meta_path.read_text()) == meta, f"{meta_path} was made with other settings, delete it or fix them"
-        index = list(csv.reader(open(csv_path)))[1:]
-        rows = [np.load(npy)[: int(index[-1][5])]] if index else []  # drop rows of a save interrupted between the files
-        print(f"resuming: {len(index)} texts done", flush=True)
-    n_rows = int(index[-1][5]) if index else 0
-
-    def save():  # atomic: a Ctrl+C during saving cannot corrupt the files
-        for path, write in ((npy, lambda f: np.save(f, np.concatenate(rows))), (csv_path, lambda f: csv.writer(f).writerows([header, *index]))):
-            tmp = path.with_name(path.name + ".tmp")
-            with open(tmp, "wb" if path == npy else "w", newline=None if path == npy else "") as f:
-                write(f)
-            os.replace(tmp, path)
-        meta_path.write_text(json.dumps(meta))
-
-    llm, tok = load_llm()
+    store, observer = ObserverStore(split), Observer()
     last_save, interrupted = time.time(), []
 
     def on_sigint(*_):  # vLLM aborts the running requests on Ctrl+C and may return broken outputs instead of raising
@@ -136,27 +146,23 @@ def main(split="test", n_texts=None):
 
     signal.signal(signal.SIGINT, on_sigint)
     try:
-        for c in range(len(index), len(order), CHUNK_TEXTS):
-            chunk = [(c + j, *items[order[c + j]]) for j in range(min(CHUNK_TEXTS, len(order) - c))]  # (n, url, text, label, model)
-            cuts = [cut(tok, text) for _, _, text, _, _ in chunk]
-            summaries = ask(llm, [t for t, _, _ in cuts])
-            arrs = score(llm, tok, summaries, [i for _, i, _ in cuts])
-            for (n, url, text, label, model), (_, _, trunc), summary, arr in zip(chunk, cuts, summaries, arrs):
-                index.append([f"{split}_{n}", url, model, label, n_rows, n_rows + len(arr), trunc, summary, text])
-                rows.append(arr)
-                n_rows += len(arr)
-            print(f"{len(index)}/{len(order)} texts, {n_rows} tokens", flush=True)
+        for c in range(len(store.index), len(order), CHUNK_TEXTS):
+            ns = range(c, min(c + CHUNK_TEXTS, len(order)))
+            chunk = [items[order[n]] for n in ns]  # (url, text, label, model)
+            for n, (url, text, label, model), (summary, arr, trunc) in zip(ns, chunk, observer([t for _, t, _, _ in chunk])):
+                store.add(arr, text_id=f"{split}_{n}", url=url, model=model, label=label, truncated=trunc, prompt=summary, text=text)
+            print(f"{len(store.index)}/{len(order)} texts, {store.n_rows} tokens", flush=True)
             if time.time() - last_save > SAVE_EVERY_S:
-                save()
+                store.save()
                 last_save = time.time()
     except BaseException:
         if not interrupted:  # a real error: the finally below still saves, then it is raised
             raise
         print("interrupted, saving (the unfinished chunk of texts is dropped)", flush=True)
     finally:
-        if rows:
-            save()
-            print("saved", npy, flush=True)
+        if store.rows:
+            store.save()
+            print("saved", store.npy, flush=True)
 
 
 if __name__ == "__main__":

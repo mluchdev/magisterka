@@ -1,18 +1,15 @@
-"""OpenTuringBench (MLNTeam-Unical/OpenTuringBench), the default dataset: news articles, 7 open LLMs vs human.
-
-The HF repo contains only machine texts; human articles are scraped with `fetch_otb_human.py` into
-data/openturingbench/human_<split>.jsonl. A split without that file is loaded as machine-only.
-"""
-
 import json
 import re
+import sys
 from pathlib import Path
 
 from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset
+
+sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
+from common import DATA
 
 DATASET_ID = "MLNTeam-Unical/OpenTuringBench"
-HUMAN_DIR = Path(__file__).parent.parent.parent / "data" / "openturingbench"
+HUMAN_DIR = DATA / "openturingbench"
 HEADER_LINES = 8
 # header lines like "Date: June 3, 2015" / "Category: LATINO VOICES": ~45% of machine texts, ~0% of human ones
 LABEL = re.compile(r"^\s*(date|category|news category|subtitle|subheadline|headline|published|published on|publication|publication date)\s*:", re.I)
@@ -28,39 +25,57 @@ def strip_labels(text: str) -> str:
     return "\n".join(out + lines[HEADER_LINES:])
 
 
-class OTBDataset(Dataset):
-    """Items are (url, text, label, model): label 0 = human (model "human"), 1 = machine; deduplicated by text.
-    With clean=True the machine-only header label lines (see strip_labels) are cut first.
-
-    `url` is the article id shared by a human text and its 7 machine versions, so it is NOT unique per item.
-    """
-
-    def __init__(self, split: str = "test", config: str = "in_domain", require_human: bool = True, clean: bool = True):
-        rows = list(load_dataset(DATASET_ID, config)[split].select_columns(["url", "content", "model"]))
-        human_file = HUMAN_DIR / f"human_{split}.jsonl"
-        if human_file.exists():
-            rows += [json.loads(line) for line in human_file.read_text().splitlines() if line]
-        elif require_human:
-            raise FileNotFoundError(f"{human_file} missing: run `uv run python src/data_generation/fetch_otb_human.py {split}`")
-        self.items, seen = [], set()
-        for r in rows:
-            text = strip_labels(r["content"]) if clean else r["content"]
-            if text.strip() and text not in seen:
-                seen.add(text)
-                self.items.append((r["url"], text, int(r["model"] != "human"), r["model"]))
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, i):
-        return self.items[i]
+# trailing boilerplate paragraphs (matched at paragraph start, case-insensitive): human = HuffPost promos/credits/
+# corrections, machine = notes/disclaimers/placeholders/end markers. Mapped with find_artifacts.py on test.
+FOOTER = re.compile(r"^[(\[]?\s*(note\b|editor[’']?s note|disclaimer|correction|update\b|end of (the )?article|your name|"
+                    r"keep in touch|earlier on huff|want more\?|want to read|check (it )?out|like us on|related on huffpost|"
+                    r"also on huffpost|do you have|have something to|for a constant|this (post|story|article) (was|has|originally)|"
+                    r"(additional )?reporting by|writing by|editing by|follow .{0,60} on (twitter|facebook|instagram)|"
+                    r"watch the (video|full)|click (here|through)|sign up for|to read more|you can read|a version of|for more on\b|about the author|need help\?|head over to|"
+                    r"[-*#_=~ ]+$)", re.I)
+CREDIT = re.compile(r"\s*\((additional )?(reporting|writing|editing)\b[^()]*\)\s*$", re.I)  # "... (Reporting by X; Editing by Y)"
+MAX_FOOTER = 4
 
 
-def otb_loader(split: str = "test", config: str = "in_domain", batch_size: int = 16, **kwargs) -> DataLoader:
-    """Batches of (urls, texts, labels, models); labels is a tensor, the rest are lists/tuples of str."""
-    return DataLoader(OTBDataset(split, config, **kwargs), batch_size=batch_size)
+def normalize_ws(text: str) -> str:
+    """Same whitespace as the human scraper (fetch_otb_human.clean_text): runs of whitespace inside a line -> one space,
+    no leading/trailing spaces, empty lines dropped, paragraphs joined by exactly one blank line. Typography is untouched."""
+    lines = (re.sub(r"\s+", " ", l).strip() for l in text.split("\n"))
+    return "\n\n".join(l for l in lines if l)
+
+
+def strip_footers(text: str) -> str:
+    """Drop up to MAX_FOOTER trailing boilerplate paragraphs (FOOTER) and a trailing parenthesised credit (CREDIT)."""
+    paras = text.split("\n\n")
+    for _ in range(MAX_FOOTER):
+        if len(paras) > 3 and FOOTER.match(paras[-1]):  # never eat the title/date header + first paragraph
+            paras.pop()
+    paras[-1] = CREDIT.sub("", paras[-1])
+    return "\n\n".join(paras)
+
+
+def clean_text(text: str) -> str:
+    return strip_footers(normalize_ws(strip_labels(text)))
+
+
+def load_otb(split="test", require_human=True):
+    """OpenTuringBench in_domain: news, 7 open LLMs (HF repo) vs human (scraped by fetch_otb_human.py). List of
+    (url, text, label, model): label 0 = human (model "human"), 1 = machine; cleaned by clean_text (both classes,
+    typography kept), deduplicated by text. `url` is shared by a human text and its 7 machine versions."""
+    rows = list(load_dataset(DATASET_ID, "in_domain", split=split).select_columns(["url", "content", "model"]))
+    human_file = HUMAN_DIR / f"human_{split}.jsonl"
+    if human_file.exists():
+        rows += [json.loads(line) for line in human_file.read_text().splitlines() if line]
+    elif require_human:
+        raise FileNotFoundError(f"{human_file} missing: run `uv run python src/data_generation/fetch_otb_human.py {split}`")
+    items = {}
+    for r in rows:
+        text = clean_text(r["content"])
+        if text.strip():
+            items.setdefault(text, (r["url"], text, int(r["model"] != "human"), r["model"]))
+    return list(items.values())
 
 
 if __name__ == "__main__":
-    ds = OTBDataset(require_human=False)
-    print(len(ds), "items; first:", ds[0][0], ds[0][2], ds[0][3], repr(ds[0][1][:100]))
+    items = load_otb(require_human=False)
+    print(len(items), "items; first:", items[0][0], items[0][2], items[0][3], repr(items[0][1][:100]))

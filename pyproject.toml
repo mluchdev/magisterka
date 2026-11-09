@@ -19,6 +19,7 @@ dependencies = [
     "setuptools>=84.2.1",
     "torch>=2.14.1",
     "transformers>=5.20.2",
+    "wandb>=0.31.0",
     "wheel>=0.48.0",
 ]
 
