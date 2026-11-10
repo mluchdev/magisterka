@@ -58,16 +58,12 @@ def clean_text(text: str) -> str:
     return strip_footers(normalize_ws(strip_labels(text)))
 
 
-def load_otb(split="test", require_human=True):
+def load_otb(split="test"):
     """OpenTuringBench in_domain: news, 7 open LLMs (HF repo) vs human (scraped by fetch_otb_human.py). List of
     (url, text, label, model): label 0 = human (model "human"), 1 = machine; cleaned by clean_text (both classes,
     typography kept), deduplicated by text. `url` is shared by a human text and its 7 machine versions."""
     rows = list(load_dataset(DATASET_ID, "in_domain", split=split).select_columns(["url", "content", "model"]))
-    human_file = HUMAN_DIR / f"human_{split}.jsonl"
-    if human_file.exists():
-        rows += [json.loads(line) for line in human_file.read_text().splitlines() if line]
-    elif require_human:
-        raise FileNotFoundError(f"{human_file} missing: run `uv run python src/data_generation/fetch_otb_human.py {split}`")
+    rows += [json.loads(line) for line in (HUMAN_DIR / f"human_{split}.jsonl").read_text().splitlines() if line]
     items = {}
     for r in rows:
         text = clean_text(r["content"])
@@ -75,7 +71,3 @@ def load_otb(split="test", require_human=True):
             items.setdefault(text, (r["url"], text, int(r["model"] != "human"), r["model"]))
     return list(items.values())
 
-
-if __name__ == "__main__":
-    items = load_otb(require_human=False)
-    print(len(items), "items; first:", items[0][0], items[0][2], items[0][3], repr(items[0][1][:100]))

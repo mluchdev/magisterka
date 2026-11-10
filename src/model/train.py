@@ -18,10 +18,10 @@ CFG = dict(split=sys.argv[1] if len(sys.argv) > 1 else "test", d=64, n_layers=2,
 def metrics(model, loader, groups):
     """Class accuracy / recall, plus human vs machine from the same softmax: score = log P(machine) - log P(human)."""
     model.eval()
-    out = [(model(x.cuda(), cu.cuda()).float().cpu(), y, g) for x, cu, y, g in loader]
-    l, y, g = (torch.cat(t) for t in zip(*out))
-    logp, y, g, h = torch.log_softmax(l, 1).numpy(), y.int().numpy(), g.numpy(), groups.index("human")
-    pred = logp.argmax(1)
+    out = [(model(x.cuda(), cu.cuda()).float().cpu(), g) for x, cu, g in loader]
+    l, g = (torch.cat(t) for t in zip(*out))
+    logp, g, h = torch.log_softmax(l, 1).numpy(), g.numpy(), groups.index("human")
+    pred, y = logp.argmax(1), (g != h).astype(int)
     s = np.logaddexp.reduce(np.delete(logp, h, 1), 1) - logp[:, h]
     rec = {f"recall/{n}": (pred[g == c] == c).mean() for c, n in enumerate(groups)}
     return dict(acc=(pred == g).mean(), balanced_acc=np.mean(list(rec.values())), binary_acc=((pred != h) == y).mean(),
@@ -38,7 +38,7 @@ def main():
     step = 0
     for ep in range(CFG["epochs"]):
         model.train()
-        for x, cu, y, g in data["train"]:
+        for x, cu, g in data["train"]:
             loss = F.cross_entropy(model(x.cuda(), cu.cuda()), g.cuda())
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

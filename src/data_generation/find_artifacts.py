@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # flat modules in src/
-from common import DATA, OBSERVER_MODEL
+from common import DATA
 from data.observer_data import read_index
 
 OUT = DATA / "artifacts"
@@ -77,12 +77,10 @@ def rank(df, sets, show=str, find=lambda i: "", keep_all=False):
 
 
 def main(split):
-    from transformers import AutoTokenizer
-    df, tok = read_index(split, text=True), AutoTokenizer.from_pretrained(OBSERVER_MODEL)
-    texts, dec = df.text.tolist(), lambda i: tok.decode([i])
+    df = read_index(split, text=True)
+    texts = df.text.tolist()
     scans = {
         "chars": rank(df, [set(t) for t in texts], char_name, lambda c: c),
-        "tokens": rank(df, [set(x) for x in tok(texts, add_special_tokens=False)["input_ids"]], lambda i: f"{dec(i)!r} id={i}", dec),
         "edge_ngrams": rank(df, [edge_ngrams(t) for t in texts]),
         "regex": rank(df, [{k for k, p in REGEX.items() if re.search(p, t)} for t in texts], keep_all=True),
     }

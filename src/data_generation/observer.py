@@ -22,33 +22,21 @@ from data_generation.openturingbench import load_otb
 
 OUT = DATA / "observer"
 TOP_K, MAX_TEXT_TOKENS, MAX_SUMMARY_TOKENS, SAVE_EVERY_S, SEED = 20, 5000, 400, 300, 0
-# memory settings, overridable by run_observer.py, which lowers them after an out-of-memory crash
-GPU_UTIL = float(os.environ.get("OBS_GPU_UTIL", 0.74))
-BATCHED_TOKENS = int(os.environ.get("OBS_BATCHED_TOKENS", 256))
-MAX_SEQS = int(os.environ.get("OBS_MAX_SEQS", 4))
-CHUNK_TEXTS = int(os.environ.get("OBS_CHUNK", 8))
+# GPU memory (8 GB): 0.74 is a floor for the KV cache of a 6144-token sequence, 0.80+ runs out of memory for the logits
+GPU_UTIL, BATCHED_TOKENS, MAX_SEQS, CHUNK_TEXTS = 0.74, 256, 4, 8
 NO_THINK = {"enable_thinking": False}
-RULES = "Do not copy sentences. Do not add any names, numbers, dates or facts that are not in the article. Reply with the summary only."
-WRAP = "Write a news article based on this summary.\n\nSummary: {}"
-# variant -> (prompt asking for the summary, or None = the fixed text CONTROL for every article; template of the scoring context)
-CONTROL = "Write a news article."
-VARIANTS = {
-    "summary": ("Write a detailed summary (120-180 words) of the following article. Include the key facts: who, what, where, "
-                "when, names, organizations, places, numbers and dates. " + RULES + "\n\nArticle:\n{}", WRAP),
-    "brief": ("Summarize the following article in at most 30 words. " + RULES + "\n\nArticle:\n{}", WRAP),
-    "none": (None, "{}"),
-}
-VARIANT = "summary"
+SUMMARIZE = ("Write a detailed summary (120-180 words) of the following article. Include the key facts: who, what, where, when, "
+             "names, organizations, places, numbers and dates. Do not copy sentences. Do not add any names, numbers, dates or "
+             "facts that are not in the article. Reply with the summary only.\n\nArticle:\n{}")
+WRAP = "Write a news article based on this summary.\n\nSummary: {}"  # the scoring context
 HEADER = ["text_id", "url", "model", "label", "row_start", "row_end", "truncated", "prompt", "text"]
 
 
-@dataclass
 class Observer:
-    """Nemotron (vLLM). Per article: a summary (variant's prompt, greedy), then the article teacher-forced after a fresh
-    context holding only that summary; per token 21 floats = top-20 next-token p (descending) + p(actual token)."""
-    variant: str = VARIANT
+    """Nemotron (vLLM). Per article: a summary (SUMMARIZE, greedy), then the article teacher-forced after a fresh
+    context holding only that summary (WRAP); per token 21 floats = top-20 next-token p (descending) + p(actual token)."""
 
-    def __post_init__(self):
+    def __init__(self):
         # max_num_batched_tokens: the logits of a chunk (x 131k vocab x 4 B) must fit next to the weights on the 8 GB GPU
         self.llm = LLM(OBSERVER_MODEL, max_model_len=6144, gpu_memory_utilization=GPU_UTIL, max_num_seqs=MAX_SEQS,
                        max_num_batched_tokens=BATCHED_TOKENS, trust_remote_code=True, mamba_ssm_cache_dtype="float32",
@@ -63,10 +51,7 @@ class Observer:
         return self.tok.decode(ids[:MAX_TEXT_TOKENS]), ids[:MAX_TEXT_TOKENS], True
 
     def summarize(self, texts):
-        prompt = VARIANTS[self.variant][0]
-        if prompt is None:
-            return [CONTROL] * len(texts)
-        chats = [[{"role": "user", "content": prompt.format(t)}] for t in texts]
+        chats = [[{"role": "user", "content": SUMMARIZE.format(t)}] for t in texts]
         outs = self.llm.chat(chats, SamplingParams(temperature=0, max_tokens=MAX_SUMMARY_TOKENS), chat_template_kwargs=NO_THINK)
         return [o.outputs[0].text.strip() for o in outs]
 
@@ -80,8 +65,7 @@ class Observer:
 
     def score(self, summaries, ids_list):
         """Per article an array (n_tokens, 21)."""
-        wrap = VARIANTS[self.variant][1]
-        prefixes = [self.tok(self.tok.apply_chat_template([{"role": "user", "content": wrap.format(s)}], tokenize=False,
+        prefixes = [self.tok(self.tok.apply_chat_template([{"role": "user", "content": WRAP.format(s)}], tokenize=False,
                                                           add_generation_prompt=True, **NO_THINK), add_special_tokens=False)["input_ids"]
                     for s in summaries]
         outs = self.llm.generate([{"prompt_token_ids": p + i} for p, i in zip(prefixes, ids_list)],
@@ -102,7 +86,7 @@ class ObserverStore:
     .npy) + <split>_meta.json (settings; a resume must match them). Resumes from existing files; saves atomically."""
 
     split: str
-    META = {"model": OBSERVER_MODEL, "variant": VARIANT, "seed": SEED, "top_k": TOP_K, "max_text_tokens": MAX_TEXT_TOKENS, "labels_cut": True}
+    META = {"model": OBSERVER_MODEL, "variant": "summary", "seed": SEED, "top_k": TOP_K, "max_text_tokens": MAX_TEXT_TOKENS, "labels_cut": True}
 
     def __post_init__(self):
         OUT.mkdir(parents=True, exist_ok=True)
@@ -134,11 +118,11 @@ class ObserverStore:
         self.meta.write_text(json.dumps(self.META))
 
 
-def main(split="test", n_texts=None):
-    items = load_otb(split)
-    order = random.Random(SEED).sample(range(len(items)), len(items))[:n_texts]  # fixed order: any prefix is a random sample
-    store, observer = ObserverStore(split), Observer()
-    last_save, interrupted = time.time(), []
+def run(name, rows, observer):
+    """Score rows = [(text_id, url, text, label, model)] into data/observer/<name>.* (resumes after the saved texts)."""
+    store, last_save, interrupted = ObserverStore(name), time.time(), []
+    done = [r[HEADER.index("text")] for r in store.index]
+    assert done == [r[2] for r in rows[:len(done)]], f"{store.csv} holds other texts than the input: delete data/observer/{name}.npy, _index.csv, _meta.json"
 
     def on_sigint(*_):  # vLLM aborts the running requests on Ctrl+C and may return broken outputs instead of raising
         interrupted.append(1)
@@ -146,12 +130,11 @@ def main(split="test", n_texts=None):
 
     signal.signal(signal.SIGINT, on_sigint)
     try:
-        for c in range(len(store.index), len(order), CHUNK_TEXTS):
-            ns = range(c, min(c + CHUNK_TEXTS, len(order)))
-            chunk = [items[order[n]] for n in ns]  # (url, text, label, model)
-            for n, (url, text, label, model), (summary, arr, trunc) in zip(ns, chunk, observer([t for _, t, _, _ in chunk])):
-                store.add(arr, text_id=f"{split}_{n}", url=url, model=model, label=label, truncated=trunc, prompt=summary, text=text)
-            print(f"{len(store.index)}/{len(order)} texts, {store.n_rows} tokens", flush=True)
+        for c in range(len(store.index), len(rows), CHUNK_TEXTS):
+            chunk = rows[c:c + CHUNK_TEXTS]
+            for (text_id, url, text, label, model), (summary, arr, trunc) in zip(chunk, observer([r[2] for r in chunk])):
+                store.add(arr, text_id=text_id, url=url, model=model, label=label, truncated=trunc, prompt=summary, text=text)
+            print(f"{name}: {len(store.index)}/{len(rows)} texts, {store.n_rows} tokens", flush=True)
             if time.time() - last_save > SAVE_EVERY_S:
                 store.save()
                 last_save = time.time()
@@ -163,6 +146,12 @@ def main(split="test", n_texts=None):
         if store.rows:
             store.save()
             print("saved", store.npy, flush=True)
+
+
+def main(split="test", n_texts=None):
+    items = load_otb(split)
+    order = random.Random(SEED).sample(range(len(items)), len(items))[:n_texts]  # fixed order: any prefix is a random sample
+    run(split, [(f"{split}_{n}", *items[o]) for n, o in enumerate(order)], Observer())
 
 
 if __name__ == "__main__":
